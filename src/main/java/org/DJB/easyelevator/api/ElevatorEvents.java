@@ -1,15 +1,16 @@
 package org.DJB.easyelevator.api;
 
-import net.fabricmc.fabric.api.event.Event;
-import net.fabricmc.fabric.api.event.EventFactory;
 import org.DJB.easyelevator.entity.AbstractCabinEntity;
 import org.DJB.easyelevator.logic.ElevatorController;
 
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
 /** Server hooks for integrations. Client animations should read tracked phase and door progress. */
 // 中文说明：面向整合方的服务端事件钩子。客户端动画不要订阅这些事件——它们只在服务端触发，
-// 客户端应改为读取服务端同步的 DataTracker（PHASE、DOOR、FACING、TARGET_Y）与 MotionFrame 数据包。
+// 客户端应改为读取服务端同步的 SynchedEntityData（PHASE、DOOR、FACING、TARGET_Y）与 MotionFrame 数据包。
 /**
- * 模组对外扩展 API：以 Fabric 事件的形式暴露电梯状态变化与到站通知。
+ * 模组对外扩展 API：以事件回调的形式暴露电梯状态变化与到站通知。
  *
  * <p>在整体架构中的位置：位于服务端权威链路的下游。状态机
  * {@link org.DJB.easyelevator.logic.ElevatorController} 本身不引用任何 Minecraft 类，
@@ -18,6 +19,12 @@ import org.DJB.easyelevator.logic.ElevatorController;
  *
  * <p>关键不变量：事件在服务端触发且每刻至多触发一次；回调抛出的异常会中断同一事件剩余回调的派发，
  * 并向上冒泡打断 {@link AbstractCabinEntity#tick()}，所以整合方必须自行捕获异常且不得在此做耗时的世界查询。</p>
+ *
+ * <p>与 Fabric 版的差异：原实现基于 Fabric 的 {@code EventFactory} 数组回调；NeoForge 没有等价的
+ * 轻量事件工厂，这里改用 {@link CopyOnWriteArrayList} 手工维护监听器列表，语义保持一致
+ * （按注册顺序同步调用、注册/注销无需重新获取字段）。整合方通过
+ * {@link #PHASE_CHANGED_LISTENERS} / {@link #ARRIVED_LISTENERS} 增删回调，
+ * 或直接监听 {@link #firePhaseChanged} / {@link #fireArrived} 的派发点。</p>
  */
 public final class ElevatorEvents {
 
@@ -25,7 +32,7 @@ public final class ElevatorEvents {
     private ElevatorEvents() { }
 
     // 电梯运行状态变化接口
-    // 触发时机：AbstractCabinEntity.tick() 每刻写入 DataTracker 之后，若 Phase 与上一刻不同，则以 (before, after) 调用一次。
+    // 触发时机：AbstractCabinEntity.tick() 每刻写入 SynchedEntityData 之后，若 Phase 与上一刻不同，则以 (before, after) 调用一次。
     /**
      * 电梯 Phase 变化回调。
      *
@@ -56,35 +63,45 @@ public final class ElevatorEvents {
         /**
          * 在轿厢精确到达某个站点时被调用。
          *
-         * @param cabin 到站的轿厢实体
+         * @param cabin 到站的轿厢
          * @param floorY 该站点的 Y 高度，单位为格（方块），等于站点根方块所在层的 Y 坐标
          */
         void onArrival(AbstractCabinEntity cabin, int floorY);
     }
 
     /**
-     * Phase 变化事件：数组回调语义——按监听器注册顺序依次同步调用所有回调。
+     * Phase 变化监听器列表：按注册顺序依次同步调用。
      *
-     * <p>Fabric 的数组回调实现会在监听器集合变化时重建 invoker，因此注册/注销监听器后
-     * 不必重新获取本字段，直接使用即可。任一回调抛异常会跳过其后注册的回调，
-     * 且没有隔离机制，故回调内应自建 try/catch。</p>
+     * <p>使用 {@link CopyOnWriteArrayList}：遍历期间增删监听器不会抛
+     * {@code ConcurrentModificationException}，也不需要整合方在订阅后重新获取任何字段。</p>
      */
-    public static final Event<PhaseChanged> PHASE_CHANGED = EventFactory.createArrayBacked(PhaseChanged.class,
-            callbacks -> (cabin, before, after) -> {
-                // Java 8 lambda 无法在运行时重载参数名，这里必须用 c 逐个转发（Fabric 无“批量回调”API）。
-                for (var c : callbacks)
-                    c.onChange(cabin, before, after);
-    });
+    public static final List<PhaseChanged> PHASE_CHANGED_LISTENERS = new CopyOnWriteArrayList<>();
 
     /**
-     * 到站事件：数组回调语义与 {@link #PHASE_CHANGED} 相同。
-     *
-     * <p>触发点紧挨着 ARRIVAL 音效播放，因此该事件每到达一个站点只会触发一次；
-     * BLOCKED 后恢复运行的行程不会重复触发，除非轿厢重新经过一次精确到站判定。</p>
+     * 到站监听器列表：语义与 {@link #PHASE_CHANGED_LISTENERS} 相同。
      */
-    public static final Event<Arrived> ARRIVED = EventFactory.createArrayBacked(Arrived.class,
-            callbacks -> (cabin, floorY) -> {
-                for (var c : callbacks)
-                    c.onArrival(cabin, floorY);
-    });
+    public static final List<Arrived> ARRIVED_LISTENERS = new CopyOnWriteArrayList<>();
+
+    /**
+     * 派发一次 Phase 变化事件（由 {@code AbstractCabinEntity#tick()} 调用）。
+     *
+     * <p>任一回调抛异常会跳过其后注册的回调，且没有隔离机制，故回调内应自建 try/catch。</p>
+     *
+     * @param cabin 发生变化的轿厢实体
+     * @param before 变化前的 Phase
+     * @param after 变化后的 Phase
+     */
+    public static void firePhaseChanged(AbstractCabinEntity cabin, ElevatorController.Phase before, ElevatorController.Phase after) {
+        for (PhaseChanged c : PHASE_CHANGED_LISTENERS) c.onChange(cabin, before, after);
+    }
+
+    /**
+     * 派发一次到站事件（由 {@code AbstractCabinEntity#tick()} 调用）。
+     *
+     * @param cabin 到站的轿厢
+     * @param floorY 站点高度，单位格
+     */
+    public static void fireArrived(AbstractCabinEntity cabin, int floorY) {
+        for (Arrived c : ARRIVED_LISTENERS) c.onArrival(cabin, floorY);
+    }
 }

@@ -1,6 +1,6 @@
 package org.DJB.easyelevator.logic;
 
-import net.fabricmc.loader.api.FabricLoader;
+import net.neoforged.fml.loading.FMLLoader;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -12,7 +12,7 @@ import java.util.stream.Stream;
  * 自定义到站音效的<b>权威副本</b>存储：负责把上传的 {@code .ogg} 落到磁盘、以及把它们读回来。
  *
  * <p>在整体架构中的位置：本类是"上传的音频到底存在哪"的唯一答案。它<b>不涉及任何 Minecraft 类</b>
- * （只用 Fabric 的 {@code FabricLoader} 拿游戏目录），因此服务端与客户端都能安全使用——
+ * （只用 NeoForge 的 {@code FMLLoader#getGamePath()} 拿游戏目录），因此服务端与客户端都能安全使用——
  * 这是必要的，因为：</p>
  * <ul>
  *   <li><b>服务端</b>必须能存：玩家在多人服务器上传音频时，"这份音频属于这扇门"这条事实要由服务端持有，
@@ -41,7 +41,7 @@ public final class DoorSoundPersistence {
      * @return 权威副本目录 {@code <gameDir>/config/easyelevator/arrival_sounds}
      */
     public static Path storeDir() {
-        return FabricLoader.getInstance().getGameDir().resolve("config")
+        return FMLLoader.getGamePath().resolve("config")
                 .resolve(org.DJB.easyelevator.Easyelevator.MOD_ID).resolve(STORE_DIR_NAME);
     }
 

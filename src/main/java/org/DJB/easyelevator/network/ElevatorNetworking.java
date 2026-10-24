@@ -1,22 +1,20 @@
 package org.DJB.easyelevator.network;
 
-import net.fabricmc.fabric.api.event.player.UseItemCallback;
-import net.fabricmc.fabric.api.event.player.UseBlockCallback;
-import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
-import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
-import net.fabricmc.fabric.api.networking.v1.PlayerLookup;
-import net.minecraft.block.BlockState;
-import net.minecraft.network.RegistryByteBuf;
-import net.minecraft.network.codec.PacketCodec;
-import net.minecraft.network.packet.CustomPayload;
-import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.text.Text;
-import net.minecraft.util.ActionResult;
-import net.minecraft.util.Hand;
-import net.minecraft.util.TypedActionResult;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.world.World;
+import net.neoforged.neoforge.network.PacketDistributor;
+import net.neoforged.neoforge.network.handling.IPayloadContext;
+import net.neoforged.neoforge.network.registration.PayloadRegistrar;
+import org.DJB.easyelevator.client.ClientPayloadHandlers;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.Level;
 import org.DJB.easyelevator.Easyelevator;
 import org.DJB.easyelevator.block.LandingDoorBlock;
 import org.DJB.easyelevator.block.LandingDoorBlockEntity;
@@ -29,6 +27,7 @@ import org.DJB.easyelevator.logic.ElevatorParameters;
 import org.DJB.easyelevator.logic.FloorIndicator;
 import java.util.ArrayList;
 import java.util.List;
+import net.minecraft.network.chat.Component;
 
 /**
  * 电梯模组的网络层：14 个自定义包（7 个 S2C + 7 个 C2S）+ 打开站层面板 / 厅外呼叫面板 / 门设置面板的交互事件注册，是服务端权威数据流向客户端的唯一通道。
@@ -81,22 +80,22 @@ public final class ElevatorNetworking {
      * @param riderOffset 该接收者自身 Y 与轿厢 Y 的差值，单位：格；非乘客或已停止运行时为 {@link Double#NaN}，
      *                    保留此旧协议字段；2.1.2 客户端自行判定乘客，不再使用它锁定相机
      */
-    public record MotionFrame(int entityId, long tick, double y, double riderOffset) implements CustomPayload {
+    public record MotionFrame(int entityId, long tick, double y, double riderOffset) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:motion_frame}。 */
-        public static final Id<MotionFrame> ID = new Id<>(Easyelevator.id("motion_frame"));
+        public static final CustomPacketPayload.Type<MotionFrame> ID = new CustomPacketPayload.Type<>(Easyelevator.id("motion_frame"));
         /** 线格式编解码器：字段顺序必须与 {@link #decode}/{@link #encode} 严格一致，否则两端静默错位。 */
-        public static final PacketCodec<RegistryByteBuf,MotionFrame> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,MotionFrame> CODEC = new StreamCodec<>() {
             /** 从字节流读回一帧：VarInt id、long 时间、两个 double（Y 与乘客偏移量）。 */
-            @Override public MotionFrame decode(RegistryByteBuf b) {
+            @Override public MotionFrame decode(RegistryFriendlyByteBuf b) {
                 return new MotionFrame(b.readVarInt(), b.readLong(), b.readDouble(), b.readDouble());
             }
             /** 按与解码完全对称的顺序写出各字段；顺序一旦改动即为协议不兼容。 */
-            @Override public void encode(RegistryByteBuf b, MotionFrame p) {
+            @Override public void encode(RegistryFriendlyByteBuf b, MotionFrame p) {
                 b.writeVarInt(p.entityId()); b.writeLong(p.tick()); b.writeDouble(p.y()); b.writeDouble(p.riderOffset());
             }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 向所有正在追踪该轿厢的玩家广播一帧绝对位置。
@@ -110,12 +109,12 @@ public final class ElevatorNetworking {
      * @param cabin 要同步的轿厢，必须位于服务端世界
      */
     public static void syncMotion(AbstractCabinEntity cabin) {
-        for (ServerPlayerEntity observer : PlayerLookup.tracking(cabin)) {
+        for (ServerPlayer observer : ((ServerLevel) cabin.level()).players()) {
             // 到站（包括最后一帧位移）立即释放镜头；停车补帧只平滑轿厢，不再绑定乘客。
             double riderOffset = cabin.phase() == org.DJB.easyelevator.logic.ElevatorController.Phase.MOVING
                     && cabin.hasTarget() && cabin.containsPassenger(observer)
                     ? observer.getY() - cabin.getY() : Double.NaN;
-            ServerPlayNetworking.send(observer, new MotionFrame(cabin.getId(), cabin.getWorld().getTime(), cabin.getY(), riderOffset));
+            PacketDistributor.sendToPlayer(observer, new MotionFrame(cabin.getId(), cabin.level().getGameTime(), cabin.getY(), riderOffset));
         }
     }
     /**
@@ -132,13 +131,13 @@ public final class ElevatorNetworking {
      * @param planned 停靠计划：目的站在前、排队站点随后，都用根方块坐标表示；只影响高亮
      * @param baseFloorY 基准层（1 层）的高度，单位格；没有基准层时为 {@link Integer#MIN_VALUE}
      */
-    public record OpenPanel(int entityId, List<BlockPos> stops, List<BlockPos> planned, int baseFloorY) implements CustomPayload {
+    public record OpenPanel(int entityId, List<BlockPos> stops, List<BlockPos> planned, int baseFloorY) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:open_panel}。 */
-        public static final Id<OpenPanel> ID = new Id<>(Easyelevator.id("open_panel"));
+        public static final CustomPacketPayload.Type<OpenPanel> ID = new CustomPacketPayload.Type<>(Easyelevator.id("open_panel"));
         /** 线格式编解码器；解码时对站点数量做上限校验，见下。 */
-        public static final PacketCodec<RegistryByteBuf,OpenPanel> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,OpenPanel> CODEC = new StreamCodec<>() {
             /** 读回面板内容：先用 VarInt 读数量并校验范围，再逐个读 BlockPos，最后读基准层高度。 */
-            @Override public OpenPanel decode(RegistryByteBuf buf) {
+            @Override public OpenPanel decode(RegistryFriendlyByteBuf buf) {
                 int id=buf.readVarInt();
                 // 数量在循环之前校验：负数会让循环直接不执行，超大值则可能在分配阶段就耗尽内存。
                 List<BlockPos> stops=readPositions(buf,"station");
@@ -147,7 +146,7 @@ public final class ElevatorNetworking {
                 return new OpenPanel(id,stops,planned,buf.readVarInt());
             }
             /** 写出面板内容：实体 id、站点数量与坐标、计划数量与坐标、基准层高度。 */
-            @Override public void encode(RegistryByteBuf buf, OpenPanel p) {
+            @Override public void encode(RegistryFriendlyByteBuf buf, OpenPanel p) {
                 buf.writeVarInt(p.entityId);
                 writePositions(buf,p.stops);
                 writePositions(buf,p.planned);
@@ -155,7 +154,7 @@ public final class ElevatorNetworking {
             }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 面板状态刷新（服务端 -> 客户端）：携带"停靠计划"与本线路的基准层高度。
@@ -168,18 +167,18 @@ public final class ElevatorNetworking {
      * @param planned 停靠计划：目的站在前、排队站点随后；空列表表示当前没有任何计划
      * @param baseFloorY 基准层（1 层）的高度，单位格；没有基准层时为 {@link Integer#MIN_VALUE}
      */
-    public record PanelState(int entityId, List<BlockPos> planned, int baseFloorY) implements CustomPayload {
+    public record PanelState(int entityId, List<BlockPos> planned, int baseFloorY) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:panel_state}。 */
-        public static final Id<PanelState> ID = new Id<>(Easyelevator.id("panel_state"));
+        public static final CustomPacketPayload.Type<PanelState> ID = new CustomPacketPayload.Type<>(Easyelevator.id("panel_state"));
         /** 线格式编解码器：与 OpenPanel 共用同一套坐标列表读写。 */
-        public static final PacketCodec<RegistryByteBuf,PanelState> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,PanelState> CODEC = new StreamCodec<>() {
             /** 读回一次计划快照。 */
-            @Override public PanelState decode(RegistryByteBuf buf) { return new PanelState(buf.readVarInt(),readPositions(buf,"planned stop"),buf.readVarInt()); }
+            @Override public PanelState decode(RegistryFriendlyByteBuf buf) { return new PanelState(buf.readVarInt(),readPositions(buf,"planned stop"),buf.readVarInt()); }
             /** 写出一次计划快照。 */
-            @Override public void encode(RegistryByteBuf buf,PanelState p) { buf.writeVarInt(p.entityId);writePositions(buf,p.planned);buf.writeVarInt(p.baseFloorY); }
+            @Override public void encode(RegistryFriendlyByteBuf buf,PanelState p) { buf.writeVarInt(p.entityId);writePositions(buf,p.planned);buf.writeVarInt(p.baseFloorY); }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 把轿厢当前的停靠计划推送给正在追踪它的客户端。
@@ -192,7 +191,7 @@ public final class ElevatorNetworking {
      */
     public static void syncPanel(AbstractCabinEntity cabin,List<BlockPos> planned) {
         var payload=new PanelState(cabin.getId(),List.copyOf(planned),cabin.baseFloorY());
-        for (ServerPlayerEntity observer : PlayerLookup.tracking(cabin)) ServerPlayNetworking.send(observer,payload);
+        for (ServerPlayer observer : ((ServerLevel) cabin.level()).players()) PacketDistributor.sendToPlayer(observer,payload);
     }
     /**
      * 面板上的"开门 / 关门"按键（客户端 -> 服务端）。
@@ -203,18 +202,18 @@ public final class ElevatorNetworking {
      * @param entityId 轿厢实体 id，由服务端在 {@link OpenPanel} 中给出；服务端仍会重新核对归属
      * @param open true = 开门，false = 关门
      */
-    public record DoorCommand(int entityId, boolean open) implements CustomPayload {
+    public record DoorCommand(int entityId, boolean open) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:door_command}。 */
-        public static final Id<DoorCommand> ID = new Id<>(Easyelevator.id("door_command"));
+        public static final CustomPacketPayload.Type<DoorCommand> ID = new CustomPacketPayload.Type<>(Easyelevator.id("door_command"));
         /** 线格式编解码器：VarInt 实体 id + 一个布尔命令方向。 */
-        public static final PacketCodec<RegistryByteBuf,DoorCommand> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,DoorCommand> CODEC = new StreamCodec<>() {
             /** 读回一次按键；语义校验全部留给服务端处理器。 */
-            @Override public DoorCommand decode(RegistryByteBuf buf) { return new DoorCommand(buf.readVarInt(),buf.readBoolean()); }
+            @Override public DoorCommand decode(RegistryFriendlyByteBuf buf) { return new DoorCommand(buf.readVarInt(),buf.readBoolean()); }
             /** 写出一次按键。 */
-            @Override public void encode(RegistryByteBuf buf,DoorCommand p) { buf.writeVarInt(p.entityId);buf.writeBoolean(p.open); }
+            @Override public void encode(RegistryFriendlyByteBuf buf,DoorCommand p) { buf.writeVarInt(p.entityId);buf.writeBoolean(p.open); }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 打开"厅外呼叫面板"（服务端 -> 客户端）：右键楼层门时下发，客户端据此弹出上/下/关闭三个按钮。
@@ -227,18 +226,18 @@ public final class ElevatorNetworking {
      * @param showUp 是否显示上行按钮（最顶层之上没有站点时为 false）
      * @param showDown 是否显示下行按钮（最底层之下没有站点时为 false）
      */
-    public record OpenHallPanel(BlockPos station, boolean up, boolean down, boolean showUp, boolean showDown) implements CustomPayload {
+    public record OpenHallPanel(BlockPos station, boolean up, boolean down, boolean showUp, boolean showDown) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:open_hall_panel}。 */
-        public static final Id<OpenHallPanel> ID = new Id<>(Easyelevator.id("open_hall_panel"));
+        public static final CustomPacketPayload.Type<OpenHallPanel> ID = new CustomPacketPayload.Type<>(Easyelevator.id("open_hall_panel"));
         /** 线格式编解码器：一个 BlockPos 加两个布尔。 */
-        public static final PacketCodec<RegistryByteBuf,OpenHallPanel> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,OpenHallPanel> CODEC = new StreamCodec<>() {
             /** 读回面板初值。 */
-            @Override public OpenHallPanel decode(RegistryByteBuf buf) { return new OpenHallPanel(buf.readBlockPos(),buf.readBoolean(),buf.readBoolean(),buf.readBoolean(),buf.readBoolean()); }
+            @Override public OpenHallPanel decode(RegistryFriendlyByteBuf buf) { return new OpenHallPanel(buf.readBlockPos(),buf.readBoolean(),buf.readBoolean(),buf.readBoolean(),buf.readBoolean()); }
             /** 写出面板初值。 */
-            @Override public void encode(RegistryByteBuf buf,OpenHallPanel p) { buf.writeBlockPos(p.station);buf.writeBoolean(p.up);buf.writeBoolean(p.down);buf.writeBoolean(p.showUp);buf.writeBoolean(p.showDown); }
+            @Override public void encode(RegistryFriendlyByteBuf buf,OpenHallPanel p) { buf.writeBlockPos(p.station);buf.writeBoolean(p.up);buf.writeBoolean(p.down);buf.writeBoolean(p.showUp);buf.writeBoolean(p.showDown); }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 刷新厅外呼叫面板上的按钮状态（服务端 -> 客户端）：只更新"哪个方向还在呼叫"，绝不用它打开界面。
@@ -247,18 +246,18 @@ public final class ElevatorNetworking {
      * @param up 该站上行按钮是否点亮
      * @param down 该站下行按钮是否点亮
      */
-    public record HallPanelState(BlockPos station, boolean up, boolean down) implements CustomPayload {
+    public record HallPanelState(BlockPos station, boolean up, boolean down) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:hall_panel_state}。 */
-        public static final Id<HallPanelState> ID = new Id<>(Easyelevator.id("hall_panel_state"));
+        public static final CustomPacketPayload.Type<HallPanelState> ID = new CustomPacketPayload.Type<>(Easyelevator.id("hall_panel_state"));
         /** 线格式编解码器：与 {@link OpenHallPanel} 同构。 */
-        public static final PacketCodec<RegistryByteBuf,HallPanelState> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,HallPanelState> CODEC = new StreamCodec<>() {
             /** 读回一次点亮状态。 */
-            @Override public HallPanelState decode(RegistryByteBuf buf) { return new HallPanelState(buf.readBlockPos(),buf.readBoolean(),buf.readBoolean()); }
+            @Override public HallPanelState decode(RegistryFriendlyByteBuf buf) { return new HallPanelState(buf.readBlockPos(),buf.readBoolean(),buf.readBoolean()); }
             /** 写出一次点亮状态。 */
-            @Override public void encode(RegistryByteBuf buf,HallPanelState p) { buf.writeBlockPos(p.station);buf.writeBoolean(p.up);buf.writeBoolean(p.down); }
+            @Override public void encode(RegistryFriendlyByteBuf buf,HallPanelState p) { buf.writeBlockPos(p.station);buf.writeBoolean(p.up);buf.writeBoolean(p.down); }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 按下楼层门面板上的上行 / 下行按钮（客户端 -> 服务端）。
@@ -269,18 +268,18 @@ public final class ElevatorNetworking {
      * @param station 楼层门根方块位置（站点）
      * @param up true = 上行按钮，false = 下行按钮
      */
-    public record HallCallButton(BlockPos station, boolean up) implements CustomPayload {
+    public record HallCallButton(BlockPos station, boolean up) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:hall_call_button}。 */
-        public static final Id<HallCallButton> ID = new Id<>(Easyelevator.id("hall_call_button"));
+        public static final CustomPacketPayload.Type<HallCallButton> ID = new CustomPacketPayload.Type<>(Easyelevator.id("hall_call_button"));
         /** 线格式编解码器：一个 BlockPos 加一个方向布尔。 */
-        public static final PacketCodec<RegistryByteBuf,HallCallButton> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,HallCallButton> CODEC = new StreamCodec<>() {
             /** 读回一次按键；语义校验全部留给服务端处理器。 */
-            @Override public HallCallButton decode(RegistryByteBuf buf) { return new HallCallButton(buf.readBlockPos(),buf.readBoolean()); }
+            @Override public HallCallButton decode(RegistryFriendlyByteBuf buf) { return new HallCallButton(buf.readBlockPos(),buf.readBoolean()); }
             /** 写出一次按键。 */
-            @Override public void encode(RegistryByteBuf buf,HallCallButton p) { buf.writeBlockPos(p.station);buf.writeBoolean(p.up); }
+            @Override public void encode(RegistryFriendlyByteBuf buf,HallCallButton p) { buf.writeBlockPos(p.station);buf.writeBoolean(p.up); }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 打开 / 刷新"某扇门自己的设置面板"（服务端 -> 客户端）：潜行右键楼层门时下发。
@@ -307,19 +306,19 @@ public final class ElevatorNetworking {
      */
     public record OpenDoorPanel(BlockPos station, String floorLabel,
                                 boolean enabled, int choice,
-                                boolean baseFloor, int soundSlot, int preview, boolean open) implements CustomPayload {
+                                boolean baseFloor, int soundSlot, int preview, boolean open) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:open_door_panel}。 */
-        public static final Id<OpenDoorPanel> ID = new Id<>(Easyelevator.id("open_door_panel"));
+        public static final CustomPacketPayload.Type<OpenDoorPanel> ID = new CustomPacketPayload.Type<>(Easyelevator.id("open_door_panel"));
         /** {@link #preview} 的取值：本次没有试听。 */
         public static final int PREVIEW_NONE = 0;
         /** {@link #preview} 的取值：服务端刚试听过到站提示音。 */
         public static final int PREVIEW_PLAYED = 1;
         /** 线格式编解码器：坐标、层号文本、两个设置标量、基准层、槽位、试听标记、打开标记。 */
-        public static final PacketCodec<RegistryByteBuf,OpenDoorPanel> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,OpenDoorPanel> CODEC = new StreamCodec<>() {
             /** 读回一份面板快照；层号文本做了长度上限校验，避免畸形包构造超长字符串。 */
-            @Override public OpenDoorPanel decode(RegistryByteBuf buf) {
+            @Override public OpenDoorPanel decode(RegistryFriendlyByteBuf buf) {
                 BlockPos station=buf.readBlockPos();
-                String label=buf.readString(MAX_FLOOR_LABEL);
+                String label=buf.readUtf(MAX_FLOOR_LABEL);
                 boolean enabled=buf.readBoolean(); int choice=buf.readVarInt();
                 boolean baseFloor=buf.readBoolean();
                 int slot=buf.readVarInt();
@@ -327,9 +326,9 @@ public final class ElevatorNetworking {
                 return new OpenDoorPanel(station,label,enabled,choice,baseFloor,slot,preview,buf.readBoolean());
             }
             /** 写出面板快照：字段顺序必须与解码严格一致。 */
-            @Override public void encode(RegistryByteBuf buf,OpenDoorPanel p) {
+            @Override public void encode(RegistryFriendlyByteBuf buf,OpenDoorPanel p) {
                 buf.writeBlockPos(p.station());
-                buf.writeString(p.floorLabel(),MAX_FLOOR_LABEL);
+                buf.writeUtf(p.floorLabel(),MAX_FLOOR_LABEL);
                 buf.writeBoolean(p.enabled()); buf.writeVarInt(p.choice());
                 buf.writeBoolean(p.baseFloor());
                 buf.writeVarInt(p.soundSlot());
@@ -338,7 +337,7 @@ public final class ElevatorNetworking {
             }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 修改某扇门的门音效设置（客户端 -> 服务端）。
@@ -351,23 +350,23 @@ public final class ElevatorNetworking {
      * @param choice  改动后的音效选项序号；{@code < 0}（{@link #CHOICE_UNCHANGED}）表示本次只改开关、不动选项
      * @param preview 是否要服务端当场把提示音播一次（试听）
      */
-    public record DoorSoundCommand(BlockPos station, boolean enabled, int choice, boolean preview) implements CustomPayload {
+    public record DoorSoundCommand(BlockPos station, boolean enabled, int choice, boolean preview) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:door_sound_command}。 */
-        public static final Id<DoorSoundCommand> ID = new Id<>(Easyelevator.id("door_sound_command"));
+        public static final CustomPacketPayload.Type<DoorSoundCommand> ID = new CustomPacketPayload.Type<>(Easyelevator.id("door_sound_command"));
         /** 线格式编解码器：坐标 + 开关 + 选项 + 试听。 */
-        public static final PacketCodec<RegistryByteBuf,DoorSoundCommand> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,DoorSoundCommand> CODEC = new StreamCodec<>() {
             /** 读回一次修改；语义校验全部留给服务端处理器。 */
-            @Override public DoorSoundCommand decode(RegistryByteBuf buf) {
+            @Override public DoorSoundCommand decode(RegistryFriendlyByteBuf buf) {
                 return new DoorSoundCommand(buf.readBlockPos(),buf.readBoolean(),buf.readVarInt(),buf.readBoolean());
             }
             /** 写出一次修改。 */
-            @Override public void encode(RegistryByteBuf buf,DoorSoundCommand p) {
+            @Override public void encode(RegistryFriendlyByteBuf buf,DoorSoundCommand p) {
                 buf.writeBlockPos(p.station());buf.writeBoolean(p.enabled());
                 buf.writeVarInt(p.choice());buf.writeBoolean(p.preview());
             }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 把这一站设为 / 取消整条线路的基准层（客户端 -> 服务端）。
@@ -379,18 +378,18 @@ public final class ElevatorNetworking {
      * @param station 楼层门根方块坐标
      * @param on      true = 设为基准层（1 层），false = 取消本门的基准层标记（回到默认编号）
      */
-    public record SetBaseFloor(BlockPos station, boolean on) implements CustomPayload {
+    public record SetBaseFloor(BlockPos station, boolean on) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:set_base_floor}。 */
-        public static final Id<SetBaseFloor> ID = new Id<>(Easyelevator.id("set_base_floor"));
+        public static final CustomPacketPayload.Type<SetBaseFloor> ID = new CustomPacketPayload.Type<>(Easyelevator.id("set_base_floor"));
         /** 线格式编解码器：坐标 + 一个开关。 */
-        public static final PacketCodec<RegistryByteBuf,SetBaseFloor> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,SetBaseFloor> CODEC = new StreamCodec<>() {
             /** 读回一次设置；服务端会重新确认站点与线路。 */
-            @Override public SetBaseFloor decode(RegistryByteBuf buf) { return new SetBaseFloor(buf.readBlockPos(),buf.readBoolean()); }
+            @Override public SetBaseFloor decode(RegistryFriendlyByteBuf buf) { return new SetBaseFloor(buf.readBlockPos(),buf.readBoolean()); }
             /** 写出一次设置。 */
-            @Override public void encode(RegistryByteBuf buf,SetBaseFloor p) { buf.writeBlockPos(p.station());buf.writeBoolean(p.on()); }
+            @Override public void encode(RegistryFriendlyByteBuf buf,SetBaseFloor p) { buf.writeBlockPos(p.station());buf.writeBoolean(p.on()); }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 上传一个自定义到站音效文件（客户端 -> 服务端），内容就是完整的 {@code .ogg} 字节。
@@ -405,22 +404,22 @@ public final class ElevatorNetworking {
      * @param station 楼层门根方块坐标
      * @param bytes   完整的 {@code .ogg} 文件内容
      */
-    public record DoorSoundUpload(BlockPos station, byte[] bytes) implements CustomPayload {
+    public record DoorSoundUpload(BlockPos station, byte[] bytes) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:door_sound_upload}。 */
-        public static final Id<DoorSoundUpload> ID = new Id<>(Easyelevator.id("door_sound_upload"));
+        public static final CustomPacketPayload.Type<DoorSoundUpload> ID = new CustomPacketPayload.Type<>(Easyelevator.id("door_sound_upload"));
         /** 线格式编解码器：坐标 + 长度前缀的字节数组（读取时先校验长度上限）。 */
-        public static final PacketCodec<RegistryByteBuf,DoorSoundUpload> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,DoorSoundUpload> CODEC = new StreamCodec<>() {
             /** 读回一份上传：长度在分配之前校验，见 {@link #MAX_PAYLOAD_BYTES}。 */
-            @Override public DoorSoundUpload decode(RegistryByteBuf buf) {
+            @Override public DoorSoundUpload decode(RegistryFriendlyByteBuf buf) {
                 return new DoorSoundUpload(buf.readBlockPos(),buf.readByteArray(MAX_PAYLOAD_BYTES));
             }
             /** 写出一次上传。 */
-            @Override public void encode(RegistryByteBuf buf,DoorSoundUpload p) {
+            @Override public void encode(RegistryFriendlyByteBuf buf,DoorSoundUpload p) {
                 buf.writeBlockPos(p.station());buf.writeByteArray(p.bytes());
             }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 某个门槽音频的<b>内容</b>（双向使用）：服务端用它把字节发给需要的客户端，客户端用它向服务端索取。
@@ -431,22 +430,22 @@ public final class ElevatorNetworking {
      * @param slot  门槽号
      * @param bytes 完整的 {@code .ogg} 内容；空数组表示"该槽位没有音频"
      */
-    public record DoorSoundData(int slot, byte[] bytes) implements CustomPayload {
+    public record DoorSoundData(int slot, byte[] bytes) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:door_sound_data}。 */
-        public static final Id<DoorSoundData> ID = new Id<>(Easyelevator.id("door_sound_data"));
+        public static final CustomPacketPayload.Type<DoorSoundData> ID = new CustomPacketPayload.Type<>(Easyelevator.id("door_sound_data"));
         /** 线格式编解码器：与 {@link DoorSoundUpload} 同构，只是用门槽号代替方块坐标。 */
-        public static final PacketCodec<RegistryByteBuf,DoorSoundData> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,DoorSoundData> CODEC = new StreamCodec<>() {
             /** 读回一份音频；长度在分配之前校验。 */
-            @Override public DoorSoundData decode(RegistryByteBuf buf) {
+            @Override public DoorSoundData decode(RegistryFriendlyByteBuf buf) {
                 return new DoorSoundData(buf.readVarInt(),buf.readByteArray(MAX_PAYLOAD_BYTES));
             }
             /** 写出一份音频。 */
-            @Override public void encode(RegistryByteBuf buf,DoorSoundData p) {
+            @Override public void encode(RegistryFriendlyByteBuf buf,DoorSoundData p) {
                 buf.writeVarInt(p.slot());buf.writeByteArray(p.bytes());
             }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 请求某个门槽的音频内容（客户端 -> 服务端）。
@@ -457,20 +456,20 @@ public final class ElevatorNetworking {
      *
      * @param slot 需要的门槽号；{@link #ALL_SLOTS} 表示"服务端有多少都发给我"
      */
-    public record RequestDoorSound(int slot) implements CustomPayload {
+    public record RequestDoorSound(int slot) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:request_door_sound}。 */
-        public static final Id<RequestDoorSound> ID = new Id<>(Easyelevator.id("request_door_sound"));
+        public static final CustomPacketPayload.Type<RequestDoorSound> ID = new CustomPacketPayload.Type<>(Easyelevator.id("request_door_sound"));
         /** {@link #slot()} 的哨兵值：请求"服务端现有的全部门槽音频"（进服补齐用）。 */
         public static final int ALL_SLOTS = -1;
         /** 线格式编解码器：一个定长标量。 */
-        public static final PacketCodec<RegistryByteBuf,RequestDoorSound> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,RequestDoorSound> CODEC = new StreamCodec<>() {
             /** 读回一次请求。 */
-            @Override public RequestDoorSound decode(RegistryByteBuf buf) { return new RequestDoorSound(buf.readVarInt()); }
+            @Override public RequestDoorSound decode(RegistryFriendlyByteBuf buf) { return new RequestDoorSound(buf.readVarInt()); }
             /** 写出一次请求。 */
-            @Override public void encode(RegistryByteBuf buf,RequestDoorSound p) { buf.writeVarInt(p.slot()); }
+            @Override public void encode(RegistryFriendlyByteBuf buf,RequestDoorSound p) { buf.writeVarInt(p.slot()); }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 读一个坐标列表：先读 VarInt 数量并做上限校验，再逐个读 BlockPos，最后复制成不可变列表。
@@ -479,7 +478,7 @@ public final class ElevatorNetworking {
      * @param what 出错信息里用的名字（仅用于排错）
      * @return 不可变坐标列表
      */
-    private static List<BlockPos> readPositions(RegistryByteBuf buf,String what) {
+    private static List<BlockPos> readPositions(RegistryFriendlyByteBuf buf,String what) {
         int size=buf.readVarInt();
         // 数量在循环之前校验：负数会让循环直接不执行，超大值则可能在分配阶段就耗尽内存。
         if(size<0 || size>MAX_STOPS) throw new IllegalArgumentException("Invalid elevator "+what+" count");
@@ -493,7 +492,7 @@ public final class ElevatorNetworking {
      * @param buf 写缓冲
      * @param list 坐标列表
      */
-    private static void writePositions(RegistryByteBuf buf,List<BlockPos> list) {
+    private static void writePositions(RegistryFriendlyByteBuf buf,List<BlockPos> list) {
         buf.writeVarInt(list.size()); for(BlockPos pos:list) buf.writeBlockPos(pos);
     }
     /**
@@ -505,18 +504,18 @@ public final class ElevatorNetworking {
      * @param entityId 轿厢实体 id，由服务端在 {@link OpenPanel} 中给出；服务端仍会重新核对
      * @param button 被点击的站点，即楼层门根方块的坐标（保留历史字段名 button，与旧版按钮语义兼容）
      */
-    public record SelectStop(int entityId, BlockPos button) implements CustomPayload {
+    public record SelectStop(int entityId, BlockPos button) implements CustomPacketPayload {
         /** 该负载的类型 id，注册与路由键：{@code easyelevator:select_stop}。 */
-        public static final Id<SelectStop> ID = new Id<>(Easyelevator.id("select_stop"));
+        public static final CustomPacketPayload.Type<SelectStop> ID = new CustomPacketPayload.Type<>(Easyelevator.id("select_stop"));
         /** 线格式编解码器：一段 VarInt 实体 id 加一个 BlockPos。 */
-        public static final PacketCodec<RegistryByteBuf,SelectStop> CODEC = new PacketCodec<>() {
+        public static final StreamCodec<RegistryFriendlyByteBuf,SelectStop> CODEC = new StreamCodec<>() {
             /** 读回一次点击；此处不做语义校验，全部推迟到服务端处理器里带上世界上下文再判断。 */
-            @Override public SelectStop decode(RegistryByteBuf buf) { return new SelectStop(buf.readVarInt(),buf.readBlockPos()); }
+            @Override public SelectStop decode(RegistryFriendlyByteBuf buf) { return new SelectStop(buf.readVarInt(),buf.readBlockPos()); }
             /** 写出一次点击。 */
-            @Override public void encode(RegistryByteBuf buf,SelectStop p) { buf.writeVarInt(p.entityId);buf.writeBlockPos(p.button); }
+            @Override public void encode(RegistryFriendlyByteBuf buf,SelectStop p) { buf.writeVarInt(p.entityId);buf.writeBlockPos(p.button); }
         };
         /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-        @Override public Id<? extends CustomPayload> getId() { return ID; }
+        @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
     }
     /**
      * 注册全部自定义负载与交互事件；由模组初始化时调用一次。
@@ -526,79 +525,72 @@ public final class ElevatorNetworking {
      * 并注册两个右键事件（对空处使用物品、对方块使用物品），两者都会打开轿厢内的站层面板。
      * 负载类型必须先于任何收发注册，否则客户端与服务端会因缺少 id 而断连。
      */
-    public static void register() {
-        RiderMove.register();
-        PayloadTypeRegistry.playS2C().register(MotionFrame.ID,MotionFrame.CODEC);
-        PayloadTypeRegistry.playS2C().register(OpenPanel.ID,OpenPanel.CODEC);
-        PayloadTypeRegistry.playS2C().register(PanelState.ID,PanelState.CODEC);
-        PayloadTypeRegistry.playS2C().register(OpenHallPanel.ID,OpenHallPanel.CODEC);
-        PayloadTypeRegistry.playS2C().register(HallPanelState.ID,HallPanelState.CODEC);
-        PayloadTypeRegistry.playS2C().register(OpenDoorPanel.ID,OpenDoorPanel.CODEC);
-        PayloadTypeRegistry.playS2C().register(DoorSoundData.ID,DoorSoundData.CODEC);
-        PayloadTypeRegistry.playC2S().register(SelectStop.ID,SelectStop.CODEC);
-        PayloadTypeRegistry.playC2S().register(DoorCommand.ID,DoorCommand.CODEC);
-        PayloadTypeRegistry.playC2S().register(HallCallButton.ID,HallCallButton.CODEC);
-        PayloadTypeRegistry.playC2S().register(DoorSoundCommand.ID,DoorSoundCommand.CODEC);
-        PayloadTypeRegistry.playC2S().register(SetBaseFloor.ID,SetBaseFloor.CODEC);
-        PayloadTypeRegistry.playC2S().register(DoorSoundUpload.ID,DoorSoundUpload.CODEC);
-        PayloadTypeRegistry.playC2S().register(RequestDoorSound.ID,RequestDoorSound.CODEC);
-        ServerPlayNetworking.registerGlobalReceiver(SelectStop.ID,(payload,context)->context.server().execute(()->{
+    public static void register(PayloadRegistrar registrar) {
+        RiderMove.register(registrar);
+        registrar.playToClient(MotionFrame.ID,MotionFrame.CODEC,ClientPayloadHandlers::motionFrame);
+        registrar.playToClient(OpenPanel.ID,OpenPanel.CODEC,ClientPayloadHandlers::openPanel);
+        registrar.playToClient(PanelState.ID,PanelState.CODEC,ClientPayloadHandlers::panelState);
+        registrar.playToClient(OpenHallPanel.ID,OpenHallPanel.CODEC,ClientPayloadHandlers::openHallPanel);
+        registrar.playToClient(HallPanelState.ID,HallPanelState.CODEC,ClientPayloadHandlers::hallPanelState);
+        registrar.playToClient(OpenDoorPanel.ID,OpenDoorPanel.CODEC,ClientPayloadHandlers::openDoorPanel);
+        registrar.playToClient(DoorSoundData.ID,DoorSoundData.CODEC,ClientPayloadHandlers::doorSoundData);
+        registrar.playToServer(SelectStop.ID,SelectStop.CODEC,(payload,context)->context.enqueueWork(()->{
             // 处理器在网络线程被调用，而实体/方块查询必须在服务端主线程执行，故整体切回主线程。
-            var player=context.player();
+            ServerPlayer player=(ServerPlayer) context.player();
             // 旁观者或已死亡玩家不应能操作轿厢；这里再挡一次，避免只靠客户端 ui 状态。
             if (player.isSpectator() || !player.isAlive()) return;
-            var entity=player.getServerWorld().getEntityById(payload.entityId());
+            var entity=player.level().getEntity(payload.entityId());
             // Never trust a client-provided cabin, station index, distance or line identifier.
             // 客户端可伪造任意实体 id：必须确认它在本玩家世界内、确实是轿厢、且本玩家是车上乘客。
             if (!(entity instanceof AbstractCabinEntity cabin) || !cabin.containsPassenger(player)) return;
             // 坐标同样不可信，交由轿厢对照真实线路校验（不在线路上或朝向不符时返回 false）。
             boolean accepted=cabin.requestStop(payload.button());
-            player.sendMessage(Text.translatable(accepted?"message.easyelevator.selected":"message.easyelevator.invalid_stop"),true);
+            player.displayClientMessage(Component.translatable(accepted?"message.easyelevator.selected":"message.easyelevator.invalid_stop"),true);
             // Refresh so buttons placed/broken while the screen was open are reflected immediately.
             // 重新下发面板：界面停留期间可能有人增删了站点，用服务端最新快照覆盖客户端旧列表。
             open(player,cabin);
         }));
         // 面板上的"开门 / 关门"键：与选站同样不信任客户端，服务端重新定位轿厢、核对乘客身份，
         // 开门还要求车体精确停在某个完整站点（AbstractCabinEntity.doorCommand 内部用线路站点列表校验）。
-        ServerPlayNetworking.registerGlobalReceiver(DoorCommand.ID,(payload,context)->context.server().execute(()->{
-            var player=context.player();
+        registrar.playToServer(DoorCommand.ID,DoorCommand.CODEC,(payload,context)->context.enqueueWork(()->{
+            ServerPlayer player=(ServerPlayer) context.player();
             if (player.isSpectator() || !player.isAlive()) return;
-            var entity=player.getServerWorld().getEntityById(payload.entityId());
+            var entity=player.level().getEntity(payload.entityId());
             if (!(entity instanceof AbstractCabinEntity cabin) || !cabin.containsPassenger(player)) return;
             if (cabin.doorCommand(payload.open())) open(player,cabin); // 成功后刷一次面板：计划可能已经变了
-            else player.sendMessage(Text.translatable(payload.open()
+            else player.displayClientMessage(Component.translatable(payload.open()
                     ?"message.easyelevator.door_no_station":"message.easyelevator.door_close_locked"),true);
         }));
         // 楼层门面板上的"上行 / 下行"按钮：坐标不可信，服务端重新扫描线路、核对"恰好一辆轿厢"后登记厅外呼叫；
         // 登记完立刻把该站最新的点亮状态回推给附近客户端（含按按钮的这位），按钮当场变红。
-        ServerPlayNetworking.registerGlobalReceiver(HallCallButton.ID,(payload,context)->context.server().execute(()->{
+        registrar.playToServer(HallCallButton.ID,HallCallButton.CODEC,(payload,context)->context.enqueueWork(()->{
             var player=context.player();
             if (player.isSpectator() || !player.isAlive()) return;
-            var world=player.getServerWorld();
+            var world=player.level();
             BlockPos origin=payload.station();
-            if (!world.isChunkLoaded(origin)) return;
+            if (!world.hasChunkAt(origin)) return;
             BlockState state=world.getBlockState(origin);
-            if (!LandingDoorBlock.isRoot(state) || !LandingDoorBlock.complete(world,origin)) { player.sendMessage(Text.translatable("message.easyelevator.invalid_stop"),true); return; }
+            if (!LandingDoorBlock.isRoot(state) || !LandingDoorBlock.complete(world,origin)) { player.displayClientMessage(Component.translatable("message.easyelevator.invalid_stop"),true); return; }
             ElevatorLine line=ElevatorLine.scan(world,LandingDoorBlock.railPos(state,origin));
-            if (line==null || line.facing()!=state.get(LandingDoorBlock.FACING) || !line.stops().contains(origin)) { player.sendMessage(Text.translatable("message.easyelevator.invalid_stop"),true); return; }
+            if (line==null || line.facing()!=state.getValue(LandingDoorBlock.FACING) || !line.stops().contains(origin)) { player.displayClientMessage(Component.translatable("message.easyelevator.invalid_stop"),true); return; }
             var cabins=line.cabins(world);
-            if (cabins.isEmpty()) { player.sendMessage(Text.translatable("message.easyelevator.no_cabin"),true); return; }
-            if (cabins.size()!=1) { player.sendMessage(Text.translatable("message.easyelevator.multiple_cabins"),true); return; }
+            if (cabins.isEmpty()) { player.displayClientMessage(Component.translatable("message.easyelevator.no_cabin"),true); return; }
+            if (cabins.size()!=1) { player.displayClientMessage(Component.translatable("message.easyelevator.multiple_cabins"),true); return; }
             var cabin=cabins.getFirst();
             boolean accepted=cabin.requestHallCall(origin,payload.up());
-            player.sendMessage(Text.translatable(accepted?"message.easyelevator.hall_queued":"message.easyelevator.invalid_stop",
-                    Text.translatable(payload.up()?"screen.easyelevator.hall_up":"screen.easyelevator.hall_down")),true);
+            player.displayClientMessage(Component.translatable(accepted?"message.easyelevator.hall_queued":"message.easyelevator.invalid_stop",
+                    Component.translatable(payload.up()?"screen.easyelevator.hall_up":"screen.easyelevator.hall_down")),true);
             syncHallState(world,origin,cabin.hasHallCall(origin,true),cabin.hasHallCall(origin,false));
         }));
         // 门专属设置面板上的任意一次修改（开关 / 换音效 / 试听）：坐标不可信，服务端重新定位整扇门，
         // 把改动落进方块实体 NBT（随区块存档），然后把最新快照回推给所有正在看这扇门的人（全服同步）。
-        ServerPlayNetworking.registerGlobalReceiver(DoorSoundCommand.ID,(payload,context)->context.server().execute(()->{
+        registrar.playToServer(DoorSoundCommand.ID,DoorSoundCommand.CODEC,(payload,context)->context.enqueueWork(()->{
             var player=context.player();
             if (player.isSpectator() || !player.isAlive()) return;
-            var world=player.getServerWorld();
+            ServerLevel world=(ServerLevel) player.level();
             BlockPos origin=payload.station();
             LandingDoorBlockEntity door=doorEntity(world,origin);
-            if (door==null) { player.sendMessage(Text.translatable("message.easyelevator.invalid_stop"),true); return; }
+            if (door==null) { player.displayClientMessage(Component.translatable("message.easyelevator.invalid_stop"),true); return; }
             DoorArrivalSound settings=door.arrivalSound();
             // choice < 0（CHOICE_UNCHANGED）表示"本次只改开关、不动选项"；否则整份替换。
             settings=settings.withEnabled(payload.enabled())
@@ -610,38 +602,38 @@ public final class ElevatorNetworking {
         }));
         // 面板上的"设为基准层"按钮：行为与旧版的"潜行右键门"完全一致（见 LandingDoorBlock#setFloorBase），
         // 只是入口从右键组合挪进了设置界面。
-        ServerPlayNetworking.registerGlobalReceiver(SetBaseFloor.ID,(payload,context)->context.server().execute(()->{
+        registrar.playToServer(SetBaseFloor.ID,SetBaseFloor.CODEC,(payload,context)->context.enqueueWork(()->{
             var player=context.player();
             if (player.isSpectator() || !player.isAlive()) return;
-            LandingDoorBlock.setFloorBase(player.getServerWorld(),payload.station(),player,payload.on());
+            LandingDoorBlock.setFloorBase(player.level(),payload.station(),player,payload.on());
         }));
         // 自定义到站音效上传：客户端携带的字节视为不可信输入——重新校验玩家、整扇门、ogg 魔数与大小上限，
         // 通过后才写入权威副本目录。落盘失败只回一条提示（音效是表现层，不该把服务端刻带崩）。
-        ServerPlayNetworking.registerGlobalReceiver(DoorSoundUpload.ID,(payload,context)->context.server().execute(()->{
+        registrar.playToServer(DoorSoundUpload.ID,DoorSoundUpload.CODEC,(payload,context)->context.enqueueWork(()->{
             var player=context.player();
             if (player.isSpectator() || !player.isAlive()) return;
             byte[] bytes=payload.bytes();
-            if (bytes.length==0 || bytes.length>MAX_AUDIO_BYTES) { player.sendMessage(Text.translatable("message.easyelevator.door_sound_upload_failed"),true); return; }
-            var world=player.getServerWorld();
+            if (bytes.length==0 || bytes.length>MAX_AUDIO_BYTES) { player.displayClientMessage(Component.translatable("message.easyelevator.door_sound_upload_failed"),true); return; }
+            ServerLevel world=(ServerLevel) player.level();
             BlockPos origin=payload.station();
             LandingDoorBlockEntity door=doorEntity(world,origin);
-            if (door==null) { player.sendMessage(Text.translatable("message.easyelevator.invalid_stop"),true); return; }
+            if (door==null) { player.displayClientMessage(Component.translatable("message.easyelevator.invalid_stop"),true); return; }
             int slot=door.soundSlot();
             if (!DoorSoundPersistence.store(slot,bytes)) {
-                player.sendMessage(Text.translatable("message.easyelevator.door_sound_upload_failed"),true); return;
+                player.displayClientMessage(Component.translatable("message.easyelevator.door_sound_upload_failed"),true); return;
             }
             // 把落点写进日志：槽位号是坐标哈希出来的，玩家在 config 里看到的文件名（arrival_<槽>.ogg）
             // 只有配合这一行才能对上号——排查"上传了但没声"时很有用。
             org.slf4j.LoggerFactory.getLogger("easyelevator/doorsound").info(
                     "Stored arrival sound for door {} as slot {} -> {}",origin.toShortString(),slot,DoorSoundPersistence.fileName(slot));
-            player.sendMessage(Text.translatable("message.easyelevator.door_sound_uploaded",
-                    Text.translatable("screen.easyelevator.door_sound_row")),true);
+            player.displayClientMessage(Component.translatable("message.easyelevator.door_sound_uploaded",
+                    Component.translatable("screen.easyelevator.door_sound_row")),true);
             // 上传完切到"自定义文件"并打开：玩家不必再点两下才能听到结果。
             door.setArrivalSound(door.arrivalSound().withChoice(DoorSounds.CUSTOM).withEnabled(true));
             // 把音频内容发给站点附近所有客户端：它们各自存进自己的权威副本目录并重建资源包，
             // 于是"上传者之外的玩家"也能听到同一段音频（专用服务器上同样成立，不需要托管资源包 URL）。
-            var data=new DoorSoundData(slot,bytes);
-            for (ServerPlayerEntity observer : PlayerLookup.around(world,origin,64d)) ServerPlayNetworking.send(observer,data);
+            PacketDistributor.sendToPlayersNear(world,null,
+                    origin.getX(),origin.getY(),origin.getZ(),64d,new DoorSoundData(slot,bytes));
             int preview=playArrivalPreview(world,origin,door,true);
             broadcastDoorPanel(world,origin,preview);
         }));
@@ -650,11 +642,11 @@ public final class ElevatorNetworking {
         // 因此专用服务器上同样全服一致，不需要另外托管资源包 URL。
         // 鉴权只需"非旁观且存活"：音效是公开的表现层数据（谁都能在同一站听到），
         // 且总量被 MAX_SLOTS 与单文件上限钉死，一次补齐最多几十条包。
-        ServerPlayNetworking.registerGlobalReceiver(RequestDoorSound.ID,(payload,context)->context.server().execute(()->{
-            var player=context.player();
+        registrar.playToServer(RequestDoorSound.ID,RequestDoorSound.CODEC,(payload,context)->context.enqueueWork(()->{
+            ServerPlayer player=(ServerPlayer) context.player();
             if (player.isSpectator() || !player.isAlive()) return;
             if (payload.slot()!=RequestDoorSound.ALL_SLOTS) {
-                ServerPlayNetworking.send(player,new DoorSoundData(payload.slot(),DoorSoundPersistence.read(payload.slot())));
+                PacketDistributor.sendToPlayer(player,new DoorSoundData(payload.slot(),DoorSoundPersistence.read(payload.slot())));
                 return;
             }
             // 进服补齐：最多 MAX_SLOTS 个门槽，读不到的槽位直接跳过（不回空包，省一半流量）。
@@ -662,31 +654,9 @@ public final class ElevatorNetworking {
                 int slot=DoorSounds.slotOfStem(stem);
                 if (slot<0) continue; // 文件名异常：跳过，不猜
                 byte[] bytes=DoorSoundPersistence.read(slot);
-                if (bytes.length>0) ServerPlayNetworking.send(player,new DoorSoundData(slot,bytes));
+                if (bytes.length>0) PacketDistributor.sendToPlayer(player,new DoorSoundData(slot,bytes));
             }
         }));
-        UseItemCallback.EVENT.register((player,world,hand)->{
-            // 只看主手：副手会随主手重复触发；潜行 + 空手是拆除轿厢的保留组合，不能与之抢事件。
-            if (hand!=Hand.MAIN_HAND || player.isSpectator() || player.isSneaking()) return TypedActionResult.pass(player.getStackInHand(hand));
-            // 用玩家自身碰撞箱查询，等价于"玩家是否站在轿厢内部的 3x3 空间里"。
-            for (var cabin:world.getEntitiesByClass(AbstractCabinEntity.class,player.getBoundingBox(),c->c.containsPassenger(player))) {
-                // 仅在逻辑服务端发包；客户端返回成功即可，否则会收到重复面板。
-                if (!world.isClient) open((ServerPlayerEntity)player,cabin);
-                return TypedActionResult.success(player.getStackInHand(hand));
-            }
-            return TypedActionResult.pass(player.getStackInHand(hand));
-        });
-        UseBlockCallback.EVENT.register((player,world,hand,hit)->{
-            // 与上面的 UseItem 路径互补：视线命中方块时走这里，未命中方块时走上一个回调。
-            // 条件必须完全一致，否则"对着方块右键"与"对着空气右键"行为会分叉。
-            if (hand!=Hand.MAIN_HAND || player.isSpectator() || player.isSneaking()) return ActionResult.PASS;
-            for (var cabin:world.getEntitiesByClass(AbstractCabinEntity.class,player.getBoundingBox(),c->c.containsPassenger(player))) {
-                if (!world.isClient) open((ServerPlayerEntity)player,cabin);
-                return ActionResult.SUCCESS;
-            }
-            // PASS 而非 SUCCESS：没站在轿厢里时必须把这次使用让给楼层门/轨道等其它方块逻辑。
-            return ActionResult.PASS;
-        });
     }
     /**
      * 把某个站点的厅外呼叫点亮状态推给附近客户端（登记、到站清扫、门被拆时各发一次）。
@@ -699,10 +669,11 @@ public final class ElevatorNetworking {
      * @param up 该站上行按钮是否点亮
      * @param down 该站下行按钮是否点亮
      */
-    public static void syncHallState(World world,BlockPos station,boolean up,boolean down) {
-        if (!(world instanceof ServerWorld server)) return;
-        var payload=new HallPanelState(station.toImmutable(),up,down);
-        for (ServerPlayerEntity observer : PlayerLookup.around(server,station,64d)) ServerPlayNetworking.send(observer,payload);
+    public static void syncHallState(Level world,BlockPos station,boolean up,boolean down) {
+        if (!(world instanceof ServerLevel server)) return;
+        PacketDistributor.sendToPlayersNear(server,null,
+                station.getX(),station.getY(),station.getZ(),64d,
+                new HallPanelState(station.immutable(),up,down));
     }
     /**
      * 向指定玩家下发该轿厢当前线路的站层面板快照。
@@ -712,11 +683,11 @@ public final class ElevatorNetworking {
      * @param player 目标玩家，必须是服务端玩家实体
      * @param cabin 轿厢；线路由服务端实时扫描轨道列得到（{@link AbstractCabinEntity#line()}）
      */
-    public static void open(ServerPlayerEntity player,AbstractCabinEntity cabin) {
+    public static void open(ServerPlayer player,AbstractCabinEntity cabin) {
         // line 可能为 null：轨道被破坏或区块未加载时，仍要让界面正常打开并显示空列表，而不是报错或卡住。
         var line=cabin.line();
         // limit(MAX_STOPS) 与解码端的上限校验配对；正常线路的站点数远小于该值，这里是防御性截断。
-        ServerPlayNetworking.send(player,new OpenPanel(cabin.getId(),
+        PacketDistributor.sendToPlayer(player,new OpenPanel(cabin.getId(),
                 line==null?List.of():line.stops().stream().limit(MAX_STOPS).toList(),
                 cabin.plannedStops(), cabin.baseFloorY()));
     }
@@ -730,8 +701,8 @@ public final class ElevatorNetworking {
      * @param origin 候选根方块坐标
      * @return 门的方块实体；不是本模组楼层门的根方块或整扇门不完整时为 null
      */
-    private static LandingDoorBlockEntity doorEntity(ServerWorld world,BlockPos origin) {
-        if (!world.isChunkLoaded(origin)) return null;
+    private static LandingDoorBlockEntity doorEntity(ServerLevel world,BlockPos origin) {
+        if (!world.hasChunkAt(origin)) return null;
         if (!LandingDoorBlock.isRoot(world.getBlockState(origin))) return null;
         if (!LandingDoorBlock.complete(world,origin)) return null;
         return world.getBlockEntity(origin) instanceof LandingDoorBlockEntity door ? door : null;
@@ -748,12 +719,12 @@ public final class ElevatorNetworking {
      * @param wanted 玩家是否要求了试听；false 时直接返回 {@link OpenDoorPanel#PREVIEW_NONE}
      * @return {@link OpenDoorPanel#PREVIEW_NONE} 或 {@link OpenDoorPanel#PREVIEW_PLAYED}
      */
-    private static int playArrivalPreview(ServerWorld world,BlockPos origin,LandingDoorBlockEntity door,boolean wanted) {
+    private static int playArrivalPreview(ServerLevel world,BlockPos origin,LandingDoorBlockEntity door,boolean wanted) {
         if (!wanted) return OpenDoorPanel.PREVIEW_NONE;
-        net.minecraft.sound.SoundEvent event=door.arrivalEvent();
+        net.minecraft.sounds.SoundEvent event=door.arrivalEvent();
         if (event==null) return OpenDoorPanel.PREVIEW_NONE; // 开关关着、或自定义槽位还没有音频
         world.playSound(null,origin.getX()+.5,origin.getY()+.5,origin.getZ()+.5,event,
-                net.minecraft.sound.SoundCategory.BLOCKS,ElevatorParameters.EVENT_VOLUME,ElevatorParameters.SOUND_PITCH);
+                net.minecraft.sounds.SoundSource.BLOCKS,ElevatorParameters.EVENT_VOLUME,ElevatorParameters.SOUND_PITCH);
         return OpenDoorPanel.PREVIEW_PLAYED;
     }
     /**
@@ -769,11 +740,12 @@ public final class ElevatorNetworking {
      * @param origin 站点根方块坐标
      * @param preview 本次要提示的试听状态（见 {@link OpenDoorPanel#PREVIEW_NONE} 等常量）
      */
-    public static void broadcastDoorPanel(World world,BlockPos origin,int preview) {
-        if (!(world instanceof ServerWorld server)) return;
+    public static void broadcastDoorPanel(Level world,BlockPos origin,int preview) {
+        if (!(world instanceof ServerLevel server)) return;
         OpenDoorPanel payload=doorPanel(server,origin,preview,false);
         if (payload==null) return;
-        for (ServerPlayerEntity observer : PlayerLookup.around(server,origin,64d)) ServerPlayNetworking.send(observer,payload);
+        PacketDistributor.sendToPlayersNear(server,null,
+                origin.getX(),origin.getY(),origin.getZ(),64d,payload);
     }
     /**
      * 把某扇门的设置面板快照单独发给一个玩家（潜行右键打开面板时用）。
@@ -785,10 +757,10 @@ public final class ElevatorNetworking {
      * @param origin 站点根方块坐标
      * @param preview 本次要提示的试听状态（打开面板时恒为 {@link OpenDoorPanel#PREVIEW_NONE}）
      */
-    public static void sendDoorPanel(ServerPlayerEntity player,BlockPos origin,int preview) {
-        if (!(player.getServerWorld() instanceof ServerWorld server)) return;
+    public static void sendDoorPanel(ServerPlayer player,BlockPos origin,int preview) {
+        if (!(player.level() instanceof ServerLevel server)) return;
         OpenDoorPanel payload=doorPanel(server,origin,preview,true);
-        if (payload!=null) ServerPlayNetworking.send(player,payload);
+        if (payload!=null) PacketDistributor.sendToPlayer(player,payload);
     }
     /**
      * 构造某扇门的设置面板快照（打开面板与"改动后刷新"两条路径的唯一来源）。
@@ -802,10 +774,10 @@ public final class ElevatorNetworking {
      * @param open 是否允许客户端主动打开界面
      * @return 面板快照；拿不到门时返回 null
      */
-    private static OpenDoorPanel doorPanel(ServerWorld server,BlockPos origin,int preview,boolean open) {
+    private static OpenDoorPanel doorPanel(ServerLevel server,BlockPos origin,int preview,boolean open) {
         if (!(doorEntity(server,origin) instanceof LandingDoorBlockEntity door)) return null;
         DoorArrivalSound sound=door.arrivalSound();
-        return new OpenDoorPanel(origin.toImmutable(),floorLabel(server,origin),
+        return new OpenDoorPanel(origin.immutable(),floorLabel(server,origin),
                 sound.enabled(),sound.choice(),door.baseFloor(),door.soundSlot(),preview,open);
     }
     /**
@@ -819,7 +791,7 @@ public final class ElevatorNetworking {
      * @param origin 站点根方块坐标
      * @return 该站的层号文本；线路无效时返回 {@code "--"}
      */
-    private static String floorLabel(ServerWorld world,BlockPos origin) {
+    private static String floorLabel(ServerLevel world,BlockPos origin) {
         ElevatorLine line=ElevatorLine.scan(world,LandingDoorBlock.railPos(world.getBlockState(origin),origin));
         if (line==null) return FloorIndicator.format(0);
         List<BlockPos> stops=line.stops();
@@ -850,9 +822,29 @@ public final class ElevatorNetworking {
      * @return 基准层高度（格）；没有任何门带标记时返回 {@link Integer#MIN_VALUE}，
      *         即 {@link FloorIndicator#baseIndex} 会退回"最低站点 = 1 层"的默认编号
      */
-    private static int baseFloorY(ServerWorld world,List<BlockPos> stops) {
+    private static int baseFloorY(ServerLevel world,List<BlockPos> stops) {
         for (BlockPos stop:stops)
             if (world.getBlockEntity(stop) instanceof LandingDoorBlockEntity door && door.baseFloor()) return stop.getY();
         return Integer.MIN_VALUE;
+    }
+
+    /**
+     * 负载注册订阅（模组总线，两端都会执行）：把 7 个 S2C + 7 个 C2S 负载
+     * （另有 {@link RiderMove} 自己的一对）连同处理器一次性注册进 NeoForge 的网络注册表。
+     *
+     * <p>对应 Fabric 版 {@code PayloadTypeRegistry} + {@code ServerPlayNetworking.registerGlobalReceiver}
+     * 两步注册：NeoForge 的 {@code playToClient/playToServer} 一次同时完成"类型 + 编解码器 + 处理器"。</p>
+     *
+     * <p>S2C 处理器放在 {@code ClientPayloadHandlers}（客户端类，带 dist 守卫），
+     * 使专用服务端只需加载公共的处理器签名、绝不会触达客户端代码。</p>
+     */
+    @EventBusSubscriber(modid = Easyelevator.MOD_ID, bus = EventBusSubscriber.Bus.MOD)
+    public static final class Registration {
+        private Registration() { }
+
+        @SubscribeEvent
+        public static void onRegisterPayloadHandlers(RegisterPayloadHandlersEvent event) {
+            ElevatorNetworking.register(event.registrar("1"));
+        }
     }
 }

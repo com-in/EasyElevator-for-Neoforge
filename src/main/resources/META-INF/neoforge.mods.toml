@@ -1,0 +1,38 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+
+# NeoForge 1.21.1 (FML javafml 4.0) mod metadata for EasyElevator.
+# Migrated from fabric.mod.json; the mod's @Mod entry point, @EventBusSubscriber
+# registrars and Mixin configs are all NeoForge-compatible.
+
+license="All-Rights-Reserved"
+
+[[mods]]
+modId="easyelevator"
+version="2.3.1"
+displayName="EasyElevator"
+description="沿轨道运行的电梯：楼层门呼叫、轿厢选站、高精度移动、门联锁及音效接口。"
+authors="DJB"
+logoFile="assets/easyelevator/icon.png"
+
+# Mixin configs (common + client-only). NeoForge applies these at startup.
+[[mixins]]
+config="easyelevator.mixins.json"
+
+[[mixins]]
+config="easyelevator.client.mixins.json"
+
+# Mandatory runtime dependencies.
+[[dependencies.easyelevator]]
+modId="minecraft"
+type="required"
+versionRange="[1.21.1,1.21.2)"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.easyelevator]]
+modId="neoforge"
+type="required"
+versionRange="[21.1,)"
+ordering="NONE"
+side="BOTH"

@@ -1,12 +1,11 @@
 package org.DJB.easyelevator.network;
 
-import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
-import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
-import net.minecraft.network.RegistryByteBuf;
-import net.minecraft.network.codec.PacketCodec;
-import net.minecraft.network.packet.CustomPayload;
-import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
-import net.minecraft.server.network.ServerPlayerEntity;
+import net.neoforged.neoforge.network.registration.PayloadRegistrar;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.server.level.ServerPlayer;
 import org.DJB.easyelevator.Easyelevator;
 import org.DJB.easyelevator.entity.AbstractCabinEntity;
 import org.DJB.easyelevator.logic.RiderMotionHistory;
@@ -17,7 +16,7 @@ import org.DJB.easyelevator.logic.RiderMotionHistory;
  *
  * <p>为什么需要它：两端对"地板在哪"的认知有一趟单程延迟。客户端是在收到
  * {@link ElevatorNetworking.MotionFrame} 之后才把轿厢搬上去的，玩家在客户端算出的绝对 Y 是
- * "当时的轿厢 Y + 相对高度"；包到服务端时轿厢已经又走了一段，若原样交给原版 {@code onPlayerMove}，
+ * "当时的轿厢 Y + 相对高度"；包到服务端时轿厢已经又走了一段，若原样交给原版 {@code handleMovePlayer}，
  * 服务端会把这段差算成玩家自己在飞（触发拉回或悬浮判定）。因此客户端把"本包的 Y 是相对于哪个轿厢样本
  * 算出来的"（{@link #tick()}）一并送上，服务端再用自己权威的样本高度（
  * {@link AbstractCabinEntity#motionHeight}）把 Y 重新基准化——水平移动与跳跃高度原样保留，
@@ -51,18 +50,18 @@ import org.DJB.easyelevator.logic.RiderMotionHistory;
  */
 public record RiderMove(int cabinId, long tick, double x, double y, double z,
                         float yaw, float pitch, boolean ground, boolean position, boolean look)
-        implements CustomPayload {
+        implements CustomPacketPayload {
     /** 负载类型 id，注册与路由键：{@code easyelevator:rider_move}。 */
-    public static final Id<RiderMove> ID = new Id<>(Easyelevator.id("rider_move"));
+    public static final CustomPacketPayload.Type<RiderMove> ID = new CustomPacketPayload.Type<>(Easyelevator.id("rider_move"));
     /** 线格式编解码器：字段顺序必须与 {@link #decode}/{@link #encode} 严格一致，否则两端静默错位。 */
-    public static final PacketCodec<RegistryByteBuf, RiderMove> CODEC = new PacketCodec<>() {
+    public static final StreamCodec<RegistryFriendlyByteBuf, RiderMove> CODEC = new StreamCodec<>() {
         /** 从字节流按固定顺序读回一包移动：VarInt 实体 id、long 样本编号、3 个 double 坐标、两个 float 视角、3 个布尔标志。 */
-        @Override public RiderMove decode(RegistryByteBuf b) {
+        @Override public RiderMove decode(RegistryFriendlyByteBuf b) {
             return new RiderMove(b.readVarInt(), b.readLong(), b.readDouble(), b.readDouble(),
                     b.readDouble(), b.readFloat(), b.readFloat(), b.readBoolean(), b.readBoolean(), b.readBoolean());
         }
         /** 按与解码完全对称的顺序写出；顺序一旦改动即为协议不兼容。 */
-        @Override public void encode(RegistryByteBuf b, RiderMove p) {
+        @Override public void encode(RegistryFriendlyByteBuf b, RiderMove p) {
             b.writeVarInt(p.cabinId); b.writeLong(p.tick);
             b.writeDouble(p.x); b.writeDouble(p.y); b.writeDouble(p.z);
             b.writeFloat(p.yaw); b.writeFloat(p.pitch);
@@ -82,13 +81,13 @@ public record RiderMove(int cabinId, long tick, double x, double y, double z,
      * @param p 原版此刻决定发送的移动包
      * @return 可直接发送的乘客移动包
      */
-    public static RiderMove of(int cabinId, long tick, PlayerMoveC2SPacket p) {
+    public static RiderMove of(int cabinId, long tick, ServerboundMovePlayerPacket p) {
         return new RiderMove(cabinId, tick, p.getX(0), p.getY(0), p.getZ(0),
-                p.getYaw(0), p.getPitch(0), p.isOnGround(), p.changesPosition(), p.changesLook());
+                p.getYRot(0), p.getXRot(0), p.isOnGround(), p.hasPosition(), p.hasRotation());
     }
 
     /** @return 负载类型 id，框架据此把包分发到对应接收器 */
-    @Override public Id<? extends CustomPayload> getId() { return ID; }
+    @Override public CustomPacketPayload.Type<? extends CustomPacketPayload> type() { return ID; }
 
     /**
      * 还原成原版移动包，但 Y 换成调用方给定的值。
@@ -98,13 +97,13 @@ public record RiderMove(int cabinId, long tick, double x, double y, double z,
      * （服务端据此判定作弊或误触发移动）。
      *
      * @param adjustedY 已经换算回服务端当前帧的玩家 Y，单位：格
-     * @return 可直接交给 {@code ServerPlayNetworkHandler#onPlayerMove} 的原版移动包
+     * @return 可直接交给 {@code ServerGamePacketListenerImpl#handleMovePlayer} 的原版移动包
      */
-    public PlayerMoveC2SPacket vanilla(double adjustedY) {
-        if (position && look) return new PlayerMoveC2SPacket.Full(x, adjustedY, z, yaw, pitch, ground);
-        if (position) return new PlayerMoveC2SPacket.PositionAndOnGround(x, adjustedY, z, ground);
-        if (look) return new PlayerMoveC2SPacket.LookAndOnGround(yaw, pitch, ground);
-        return new PlayerMoveC2SPacket.OnGroundOnly(ground);
+    public ServerboundMovePlayerPacket vanilla(double adjustedY) {
+        if (position && look) return new ServerboundMovePlayerPacket.PosRot(x, adjustedY, z, yaw, pitch, ground);
+        if (position) return new ServerboundMovePlayerPacket.Pos(x, adjustedY, z, ground);
+        if (look) return new ServerboundMovePlayerPacket.Rot(yaw, pitch, ground);
+        return new ServerboundMovePlayerPacket.StatusOnly(ground);
     }
 
     /**
@@ -114,16 +113,16 @@ public record RiderMove(int cabinId, long tick, double x, double y, double z,
      * 玩家确实是该厢乘客、样本编号能查到、玩家相对该样本的高度在 -0.1..2.8 格之间（站地板到顶板净高）、
      * 水平位置距轿厢中心不超过 1.9 格。任一不满足就<b>原样投递</b>——等价于纯原版行为，绝不会凭空多给位移。
      *
-     * <p>副作用：调用 {@code ServerPlayNetworkHandler#onPlayerMove}，因此会真实更新玩家位置、
+     * <p>副作用：调用 {@code ServerGamePacketListenerImpl#handleMovePlayer}，因此会真实更新玩家位置、
      * 触发原版速度/碰撞/传送校验（本包不豁免任何一条）。
      *
      * @param player 发包的玩家；<b>只允许在服务端主线程调用</b>（{@link #register()} 的接收器已用
      *               {@code context.server().execute} 切回主线程）
      */
-    public void apply(ServerPlayerEntity player) {
+    public void apply(ServerPlayer player) {
         double adjustedY = y;
-        if (position && player.isAlive() && !player.isSpectator() && !player.hasVehicle()
-                && player.getWorld().getEntityById(cabinId) instanceof AbstractCabinEntity cabin
+        if (position && player.isAlive() && !player.isSpectator() && !player.isPassenger()
+                && player.level().getEntity(cabinId) instanceof AbstractCabinEntity cabin
                 && cabin.containsPassenger(player)) {
             double seenY = cabin.motionHeight(tick);
             // 只接受"确实存在的近期服务端样本"，并且身体必须贴近这辆轿厢：
@@ -136,7 +135,7 @@ public record RiderMove(int cabinId, long tick, double x, double y, double z,
                 adjustedY = RiderMotionHistory.rebase(y, seenY, cabin.getY());
             }
         }
-        player.networkHandler.onPlayerMove(vanilla(adjustedY));
+        player.connection.handleMovePlayer(vanilla(adjustedY));
     }
 
     /**
@@ -145,9 +144,8 @@ public record RiderMove(int cabinId, long tick, double x, double y, double z,
      * <p>注册必须先于任何收发，否则两端会因缺少 id 而断连。接收器在网络线程被调用，故整体切回服务端主线程
      * 再执行 {@link #apply}——实体查询与玩家位置更新都只能在主线程做。
      */
-    public static void register() {
-        PayloadTypeRegistry.playC2S().register(ID, CODEC);
-        ServerPlayNetworking.registerGlobalReceiver(ID, (packet, context) ->
-                context.server().execute(() -> packet.apply(context.player())));
+    public static void register(PayloadRegistrar registrar) {
+        registrar.playToServer(ID, CODEC, (packet, context) ->
+                context.enqueueWork(() -> packet.apply((ServerPlayer) context.player())));
     }
 }

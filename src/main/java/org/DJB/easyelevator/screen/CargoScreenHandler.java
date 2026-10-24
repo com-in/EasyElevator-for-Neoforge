@@ -1,16 +1,16 @@
 package org.DJB.easyelevator.screen;
 
-import net.minecraft.entity.player.PlayerEntity;
-import net.minecraft.entity.player.PlayerInventory;
-import net.minecraft.inventory.Inventory;
-import net.minecraft.inventory.SimpleInventory;
-import net.minecraft.item.ItemStack;
-import net.minecraft.screen.ArrayPropertyDelegate;
-import net.minecraft.screen.PropertyDelegate;
-import net.minecraft.screen.ScreenHandler;
-import net.minecraft.screen.slot.Slot;
-import net.minecraft.screen.slot.SlotActionType;
-import net.minecraft.text.Text;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.Container;
+import net.minecraft.world.SimpleContainer;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.inventory.SimpleContainerData;
+import net.minecraft.world.inventory.ContainerData;
+import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.Slot;
+import net.minecraft.world.inventory.ClickType;
+import net.minecraft.network.chat.Component;
 import org.DJB.easyelevator.Easyelevator;
 import org.DJB.easyelevator.entity.PowerfulCabinEntity;
 import org.DJB.easyelevator.logic.CargoLoad;
@@ -20,7 +20,7 @@ import org.DJB.easyelevator.logic.CargoLoad;
  *
  * <p>为什么用<b>原版容器事务</b>而不是自写面板逻辑：拖放分配、Shift 快捷搬运、数字键交换、
  * 光标物品、多人同时装卸、断线重连后的槽位同步、光标上的物品被服务端回收——这些原版
- * {@link ScreenHandler} 全都已经处理过一遍（包括各种复制漏洞的防护）。自写一套等于把这些
+ * {@link AbstractContainerMenu} 全都已经处理过一遍（包括各种复制漏洞的防护）。自写一套等于把这些
  * 边界重做一遍，且必须逐条重新验证。因此这里只做两件原版没有的事：
  * <ol>
  *   <li><b>动态单格上限</b>：每格的插入上限不是 64，而是"装到下一档货量之前最多还能放几件"
@@ -31,43 +31,43 @@ import org.DJB.easyelevator.logic.CargoLoad;
  *
  * <p><b>两个构造器分别服务两端</b>，这是理解本类所有 {@code cabin == null} 判断的关键：
  * <ul>
- *   <li>{@link #CargoScreenHandler(int, PlayerInventory)}（2 参）是 {@link Easyelevator#CARGO_SCREEN}
+ *   <li>{@link #CargoScreenHandler(int, Container)}（2 参）是 {@link Easyelevator#CARGO_SCREEN}
  *       的类型工厂，<b>只在客户端</b>被原版调用：客户端拿到服务端发来的 {@code syncId} 后新建一个
  *       空壳实例，槽位内容与"货物件数"属性随后由原版容器同步包填写。它<b>没有轿厢实体</b>
  *       （{@code cabin == null}），因此一切需要问轿厢的地方都必须退化：可开性不判定（
- *       {@link #canUse} 返回 true，真正的把关在服务端），单格上限固定 64（客户端不该替服务端
+ *       {@link #stillValid} 返回 true，真正的把关在服务端），单格上限固定 64（客户端不该替服务端
  *       猜货箱占用）。</li>
- *   <li>{@link #CargoScreenHandler(int, PlayerInventory, PowerfulCabinEntity)}（3 参）<b>只在服务端</b>
- *       由 {@code PowerfulCabinEntity.interact} 创建，直接持有轿厢：{@link #canUse} 因此每刻都能
+ *   <li>{@link #CargoScreenHandler(int, Container, PowerfulCabinEntity)}（3 参）<b>只在服务端</b>
+ *       由 {@code PowerfulCabinEntity.interact} 创建，直接持有轿厢：{@link #stillValid} 因此每刻都能
  *       重新问"这个人还算不算厢内乘客"，单格上限也随实际货量实时变化。</li>
  * </ul>
  * 两者最终都汇到私有构造器里接线，槽位排布与属性注册只有一份。
  */
-public class CargoScreenHandler extends ScreenHandler {
+public class CargoScreenHandler extends AbstractContainerMenu {
     /** 服务端实例持有的轿厢；客户端空壳为 null（见类注释）。 */
     private final PowerfulCabinEntity cabin;
-    /** 货舱库存：服务端是轿厢那个持久化 {@link SimpleInventory}，客户端是等同步的空壳。 */
-    private final Inventory cargo;
+    /** 货舱库存：服务端是轿厢那个持久化 {@link SimpleContainer}，客户端是等同步的空壳。 */
+    private final Container cargo;
     /** 同步给客户端的"货物件数"（槽位 0）：面板上的件数、进度条与限载人数都由它算出来。 */
-    private final PropertyDelegate properties;
+    private final ContainerData properties;
 
     /**
-     * 客户端空壳构造器：由 {@link net.minecraft.screen.ScreenHandlerType} 工厂调用。
+     * 客户端空壳构造器：由 {@link net.minecraft.world.inventory.MenuType} 工厂调用。
      *
-     * <p>槽位内容与货物件数由原版容器同步包填入；这里造的 {@link SimpleInventory} 与
-     * {@link ArrayPropertyDelegate} 都只是"等着被填"的容器，因此不需要（也拿不到）轿厢。
+     * <p>槽位内容与货物件数由原版容器同步包填入；这里造的 {@link SimpleContainer} 与
+     * {@link DataSlot} 都只是"等着被填"的容器，因此不需要（也拿不到）轿厢。
      *
      * @param syncId 服务端分配的本会话编号，两端必须一致
      * @param playerInventory 查看者的背包
      */
-    public CargoScreenHandler(int syncId, PlayerInventory playerInventory) {
-        this(syncId, playerInventory, null, new SimpleInventory(CargoLoad.SLOTS), new ArrayPropertyDelegate(1));
+    public CargoScreenHandler(int syncId, Container playerInventory) {
+        this(syncId, playerInventory, null, new SimpleContainer(CargoLoad.SLOTS), new SimpleContainerData(1));
     }
 
     /**
      * 服务端构造器：由 {@code PowerfulCabinEntity.interact} 在玩家潜行右键舱壁时创建。
      *
-     * <p>三个入参都直接指向活着的轿厢：库存就是它那两个持久化 {@link SimpleInventory}，
+     * <p>三个入参都直接指向活着的轿厢：库存就是它那两个持久化 {@link SimpleContainer}，
      * "货物件数"属性则每次都现问 {@link PowerfulCabinEntity#cargoItems()}——因此装卸过程中
      * 面板上的数字与实体真正用于判超载的数字永远是同一个来源，不存在两份计数。
      *
@@ -75,12 +75,12 @@ public class CargoScreenHandler extends ScreenHandler {
      * @param playerInventory 查看者的背包
      * @param cabin 提供货舱与限载的重载轿厢
      */
-    public CargoScreenHandler(int syncId, PlayerInventory playerInventory, PowerfulCabinEntity cabin) {
-        this(syncId, playerInventory, cabin, cabin.cargo(), new PropertyDelegate() {
+    public CargoScreenHandler(int syncId, Container playerInventory, PowerfulCabinEntity cabin) {
+        this(syncId, playerInventory, cabin, cabin.cargo(), new ContainerData() {
             public int get(int index) { return cabin.cargoItems(); }
             /** 服务端不需要被写回：属性同步是单向的（服务端 → 客户端）。 */
             public void set(int index, int value) {}
-            public int size() { return 1; }
+            public int getCount() { return 1; }
         });
     }
 
@@ -96,27 +96,27 @@ public class CargoScreenHandler extends ScreenHandler {
      * @param cargo 货舱库存
      * @param properties 货物件数属性（大小 1）
      */
-    private CargoScreenHandler(int syncId, PlayerInventory playerInventory, PowerfulCabinEntity cabin,
-                               Inventory cargo, PropertyDelegate properties) {
+    private CargoScreenHandler(int syncId, Container playerInventory, PowerfulCabinEntity cabin,
+                               Container cargo, ContainerData properties) {
         super(Easyelevator.CARGO_SCREEN, syncId);
         this.cabin = cabin;
         this.cargo = cargo;
         this.properties = properties;
-        addProperties(properties);
+        addDataSlots(properties);
         for (int row = 0; row < 3; row++) for (int column = 0; column < 9; column++) {
             final int index = column + row * 9;
             addSlot(new Slot(cargo, index, 8 + column * 18, 54 + row * 18) {
                 /** 上限为 0 的格子连"放不进去"都不该被点亮，因此直接按 0 上限拒绝。 */
-                @Override public boolean canInsert(ItemStack stack) {
-                    return getMaxItemCount(stack) > 0;
+                @Override public boolean mayPlace(ItemStack stack) {
+                    return getMaxStackSize(stack) > 0;
                 }
                 /** 本格当前允许的堆叠上限：服务端随货量与货箱占用实时变化，客户端固定 64（见类注释）。 */
-                @Override public int getMaxItemCount() {
+                @Override public int getMaxStackSize() {
                     return cabin == null ? 64 : cabin.cargoSlotLimit(index);
                 }
                 /** 再与物品自身的堆叠上限取较小值：剑仍然是 1 格 1 件。 */
-                @Override public int getMaxItemCount(ItemStack stack) {
-                    return Math.min(stack.getMaxCount(), getMaxItemCount());
+                @Override public int getMaxStackSize(ItemStack stack) {
+                    return Math.min(stack.getMaxStackSize(), getMaxStackSize());
                 }
             });
         }
@@ -145,14 +145,14 @@ public class CargoScreenHandler extends ScreenHandler {
      * @param player 查看者
      * @return 允许继续操作时为 true
      */
-    @Override public boolean canUse(PlayerEntity player) { return cabin == null || cabin.canUseCargo(player); }
+    @Override public boolean stillValid(Player player) { return cabin == null || cabin.canUseCargo(player); }
 
     /**
      * 槽位点击的统一入口（原版所有操作——点、Shift 点、数字键、拖放分配——最终都走这里）。
      *
      * <p>额外做两件事：
      * <ol>
-     *   <li>{@code cargo.markDirty()}：让轿厢重算并同步"货物件数"，因此面板数字与限载在同一刻更新；</li>
+     *   <li>{@code cargo.setChanged()}：让轿厢重算并同步"货物件数"，因此面板数字与限载在同一刻更新；</li>
      *   <li>若本次点击后件数<b>没变</b>、且后部货箱空间正被占用，就发一条 actionbar 提示
      *       （{@code message.easyelevator.cargo_space}）。这是"装不进去"唯一的可见原因：
      *       单格上限被 {@code cargoSlotLimit} 压到 0 时，原版只会安静地拒绝，玩家无从知道要挪开谁。</li>
@@ -165,13 +165,13 @@ public class CargoScreenHandler extends ScreenHandler {
      * @param action 原版动作类型（拾取、Shift 搬运、数字键交换、拖放分配……）
      * @param player 操作者
      */
-    @Override public void onSlotClick(int slotIndex, int button, SlotActionType action, PlayerEntity player) {
-        if (!canUse(player)) return;
+    @Override public void clicked(int slotIndex, int button, ClickType action, Player player) {
+        if (!stillValid(player)) return;
         int before = cabin == null ? 0 : cabin.cargoItems();
-        super.onSlotClick(slotIndex, button, action, player);
-        cargo.markDirty();
+        super.clicked(slotIndex, button, action, player);
+        cargo.setChanged();
         if (cabin != null && cabin.cargoItems() == before && cabin.cargoSpaceBlocked())
-            player.sendMessage(Text.translatable("message.easyelevator.cargo_space"), true);
+            player.displayClientMessage(Component.translatable("message.easyelevator.cargo_space"), true);
     }
 
     /**
@@ -180,7 +180,7 @@ public class CargoScreenHandler extends ScreenHandler {
      * <ul>
      *   <li><b>货舱 → 背包</b>：一次 {@code insertItem} 交给原版在整段背包范围里找位置，
      *       放不下就原样返回（不丢货）；</li>
-     *   <li><b>背包 → 货舱</b>：<b>逐格</b>搬运，而且每搬完一格就 {@code cargo.markDirty()}。
+     *   <li><b>背包 → 货舱</b>：<b>逐格</b>搬运，而且每搬完一格就 {@code cargo.setChanged()}。
      *       原因见 {@code PowerfulCabinEntity.cargoSlotLimit}：每格的插入上限取决于<b>当前</b>货量
      *       （装到下一档就会出现新货箱），如果先算好"这批货能放进去"再逐格塞，就会出现
      *       "重量已经涨到下一档、箱子却还没被计入占用"的窗口，于是箱子可能长在人或动物身上。
@@ -191,26 +191,26 @@ public class CargoScreenHandler extends ScreenHandler {
      * @param index 被 Shift 点击的槽位序号
      * @return 原版约定：被移动的那一堆（未移动时返回 {@link ItemStack#EMPTY}）
      */
-    @Override public ItemStack quickMove(PlayerEntity player, int index) {
-        if (!canUse(player) || index < 0 || index >= slots.size()) return ItemStack.EMPTY;
+    @Override public ItemStack quickMoveStack(Player player, int index) {
+        if (!stillValid(player) || index < 0 || index >= slots.size()) return ItemStack.EMPTY;
         Slot slot = slots.get(index);
-        if (!slot.hasStack()) return ItemStack.EMPTY;
-        ItemStack stack = slot.getStack();
+        if (!slot.hasItem()) return ItemStack.EMPTY;
+        ItemStack stack = slot.getItem();
         ItemStack original = stack.copy();
         if (index < CargoLoad.SLOTS) {
-            if (!insertItem(stack, CargoLoad.SLOTS, slots.size(), true)) return ItemStack.EMPTY;
+            if (!moveItemStackTo(stack, CargoLoad.SLOTS, slots.size(), true)) return ItemStack.EMPTY;
         } else {
             // 先让货量刷新，再评估下一格的货箱占用（见方法注释）。
             boolean moved = false;
             for (int i = 0; i < CargoLoad.SLOTS && !stack.isEmpty(); i++) {
-                moved |= insertItem(stack, i, i + 1, false);
-                cargo.markDirty();
+                moved |= moveItemStackTo(stack, i, i + 1, false);
+                cargo.setChanged();
             }
             if (!moved) return ItemStack.EMPTY;
         }
-        if (stack.isEmpty()) slot.setStack(ItemStack.EMPTY);
-        else slot.markDirty();
-        cargo.markDirty();
+        if (stack.isEmpty()) slot.set(ItemStack.EMPTY);
+        else slot.setChanged();
+        cargo.setChanged();
         return original;
     }
 }

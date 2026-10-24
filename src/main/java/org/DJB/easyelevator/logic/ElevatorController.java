@@ -444,9 +444,9 @@ public final class ElevatorController {
      * <p>运行途中（{@link Phase#MOVING} 且目的站还没到）三种情形都不成立，因此"运行时禁止开门"
      * 这条语义完全保留——电梯运行时开门键会重新变灰。
      *
-     * <p>做成 static 且<b>只吃入参、绝不查世界</b>的原因：客户端只有 {@code DataTracker} 同步出来的
+     * <p>做成 static 且<b>只吃入参、绝不查世界</b>的原因：客户端只有 {@code SynchedEntityData} 同步出来的
      * phase / 目标高度，以及面板自己那份站点列表；它<b>拿不到线路</b>——
-     * {@code AbstractCabinEntity.railX/railZ} 不进 DataTracker（客户端恒 0），
+     * {@code AbstractCabinEntity.railX/railZ} 不进 SynchedEntityData（客户端恒 0），
      * 所以客户端调用 {@code cabin.line()} 会去扫 (0, y, 0) 并（正常情况下）返回 null。
      * 一旦把世界查询写进这个判据，客户端就会永远落进"没有线路"那一支：开门键常亮、
      * 点下去却被服务端拒绝（这正是 2.2.1 修掉的那个 bug）。
@@ -477,7 +477,7 @@ public final class ElevatorController {
      * 见静态版本。
      *
      * <p><b>只允许服务端调用</b>：两个入参都由调用方从世界算出来；客户端的
-     * {@code AbstractCabinEntity.railX/railZ} 不进 DataTracker（恒 0），算不出这两个事实（见静态版本说明）。
+     * {@code AbstractCabinEntity.railX/railZ} 不进 SynchedEntityData（恒 0），算不出这两个事实（见静态版本说明）。
      *
      * @param atStation 车体是否精确停在某个完整站点上；轿厢用线路站点列表算好传进来（本类查不到世界）
      * @param hasStations 这条线路上是否至少有一扇完整的楼层门；同样由轿厢扫线路后传进来

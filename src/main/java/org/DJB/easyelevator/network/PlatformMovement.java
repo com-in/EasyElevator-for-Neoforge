@@ -6,11 +6,11 @@ package org.DJB.easyelevator.network;
  *
  * <p>背景：轿厢地板是实体而不是方块，玩家随厢上升/下降既不能"设置位置"也不能用传送完成
  * （都会被原版判成瞬移而被拉回）；正确做法是直接平移玩家坐标，同时把
- * {@code ServerPlayNetworkHandler} 中用于速度与悬浮判定的<b>移动基准</b>（{@code lastTickY} /
- * {@code updatedY}）按同一差值平移，否则服务端会把这段平台位移算成玩家自己的垂直速度。
+ * {@code ServerGamePacketListenerImpl} 中用于速度与悬浮判定的<b>移动基准</b>（{@code firstGoodY} /
+ * {@code lastGoodY}）按同一差值平移，否则服务端会把这段平台位移算成玩家自己的垂直速度。
  *
  * <p>在整体架构中的位置：唯一实现方是 {@link org.DJB.easyelevator.mixin.ServerPlayNetworkHandlerMixin}
- * （它混入原版 {@code ServerPlayNetworkHandler} 并直接改那两个私有字段）；调用方是
+ * （它混入原版 {@code ServerGamePacketListenerImpl} 并直接改那两个私有字段）；调用方是
  * {@code AbstractCabinEntity#carryPassenger}（随厢移动）与 {@code AbstractCabinEntity#tickPassengers}
  * （读档等待期判断"此刻能否安全归位"）。之所以抽成接口而不是就地转型原版类：那两个字段是私有的、
  * 也只有混入类看得见，接口把字段访问留在混入类内部，实体层只表达"我要平移这具身体"这一意图；
@@ -28,7 +28,7 @@ public interface PlatformMovement {
     /**
      * 此刻是否可以安全地平移这具身体。
      *
-     * @return 没有待确认的强制传送时为 true；有（目标类里 {@code requestedTeleportPos != null}）时 false——
+     * @return 没有待确认的强制传送时为 true；有（目标类里 {@code awaitingPositionFromClient != null}）时 false——
      *         那期间平移会被随后的传送确认当成作弊速度，因此调用方必须放弃本次随厢位移
      *         （见 {@code genuineTeleportIsNotCarried} 用例）
      */

@@ -1,7 +1,9 @@
 package org.DJB.easyelevator.client;
 
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.resource.ResourcePackManager;
+import net.neoforged.fml.loading.FMLLoader;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.server.packs.repository.PackRepository;
 import org.DJB.easyelevator.Easyelevator;
 import org.DJB.easyelevator.logic.DoorSoundPersistence;
 import org.DJB.easyelevator.logic.DoorSounds;
@@ -37,7 +39,7 @@ import java.util.stream.Stream;
  * </ul>
  * 两边用<b>同一个文件名</b>（{@code arrival_N}），所以重建就是"照抄目录"，不需要任何映射表。</p>
  *
- * <p><b>什么时候才重载资源</b>——这是本类最容易做错的地方。原版 {@code reloadResources()} 会弹出
+ * <p><b>什么时候才重载资源</b>——这是本类最容易做错的地方。原版 {@code reloadResourcePacks()} 会弹出
  * 那个红色的 Mojang "加载资源中"画面，代价高且刺眼。因此：
  * <ul>
  *   <li>{@link #rebuild()} 先把包写到临时目录，算完指纹与上次<b>相同就直接放弃</b>，连文件都不动；</li>
@@ -101,9 +103,9 @@ public final class DoorSoundPack {
             // 1) 构建到临时目录：失败时正式目录保持原样，玩家至少还有上一版音频可用
             deleteRecursively(staging);
             Files.createDirectories(staging);
-            writeString(staging.resolve("pack.mcmeta"), packMeta());
+            writeUtf(staging.resolve("pack.mcmeta"), packMeta());
             writeFromStore(staging,stems);
-            writeString(staging.resolve("assets/" + Easyelevator.MOD_ID + "/sounds.json"), soundsJson(stems));
+            writeUtf(staging.resolve("assets/" + Easyelevator.MOD_ID + "/sounds.json"), soundsJson(stems));
             // 2) 指纹没变就收工（连正式目录都不动）
             String fingerprint = fingerprint(staging);
             if (fingerprint.equals(readFingerprint())) {
@@ -152,7 +154,7 @@ public final class DoorSoundPack {
      *
      * <p>为什么值得检查：本模组的<b>权威副本</b>目录由 Fabric 的 {@code gameDir} 推导
      * （{@code logic/DoorSoundPersistence}，服务端与客户端共用同一套逻辑），而<b>资源包</b>目录必须落在
-     * {@code MinecraftClient.runDirectory} 下才会被原版扫到。正常情况下这两个根目录是同一个；
+     * {@code Minecraft.gameDirectory} 下才会被原版扫到。正常情况下这两个根目录是同一个；
      * 万一某个启动器把它们分开，资源包就会写到原版看不见的地方，表现是"上传成功但听不到声音"。
      *
      * @param packDir 本次要写入的资源包目录
@@ -160,7 +162,7 @@ public final class DoorSoundPack {
     private static void checkGameDirAssumption(Path packDir) {
         if (gameDirWarned) return;
         try {
-            Path gameDir = net.fabricmc.loader.api.FabricLoader.getInstance().getGameDir();
+            Path gameDir = FMLLoader.getGamePath();
             if (!gameDir.resolve("resourcepacks").resolve(PACK_DIR_NAME).equals(packDir)) {
                 gameDirWarned = true;
                 LOGGER.warn("The client run directory and Fabric gameDir differ ({} vs {}); "
@@ -201,7 +203,7 @@ public final class DoorSoundPack {
      *
      * @param client 客户端实例
      */
-    public static void ensureReady(MinecraftClient client) {
+    public static void ensureReady(Minecraft client) {
         if (client == null) return;
         boolean contentChanged = rebuild();
         boolean justEnabled = enable(client);
@@ -211,35 +213,38 @@ public final class DoorSoundPack {
     /**
      * 确保运行时资源包已被客户端<b>启用</b>，并把这次改动<b>写进 {@code options.txt}</b>。
      *
-     * <p><b>为什么要写 options.txt</b>：{@code ResourcePackManager.enable()} 只改内存里的
+     * <p><b>为什么要写 options.txt</b>：{@code PackRepository.enable()} 只改内存里的
      * {@code enabled} 列表，磁盘上那份"启用过哪些包"的记录（{@code options.txt} 的
-     * {@code resourcePacks:} 一行）不会跟着变。结果是<b>下次启动游戏时 {@code scanPacks()} 发现本包
+     * {@code resourcePacks:} 一行）不会跟着变。结果是<b>下次启动游戏时 {@code reload()} 发现本包
      * 并未启用</b>，于是又"新启用一次"、又重载一次资源——表现就是每次进存档都闪一遍红色
      * Mojang 加载画面。启用之后立刻把选项写盘，这条路径才会收敛：第二次进游戏时本包已经是
      * "已启用"，{@link #enable} 直接返回 false，一次重载都不会发生。
      *
-     * <p>必须在客户端主线程调用（{@code MinecraftClient} 与其选项都不是线程安全的）。
+     * <p>必须在客户端主线程调用（{@code Minecraft} 与其选项都不是线程安全的）。
      *
      * @param client 客户端实例
      * @return true 表示本次调用"刚刚把它启用起来"（调用方需要重载一次让它生效）
      */
-    public static boolean enable(MinecraftClient client) {
+    public static boolean enable(Minecraft client) {
         if (client == null) return false;
         Path dir = packDir();
         // 包不存在（没有音频、或还没建过）就什么都不做：更不该为了一个空目录去折腾资源包管理器
         if (dir == null || !Files.isRegularFile(dir.resolve("pack.mcmeta"))) return false;
         try {
-            ResourcePackManager manager = client.getResourcePackManager();
-            manager.scanPacks(); // 重新扫目录：包是运行时创建的，不扫就看不见它
+            PackRepository manager = client.getResourcePackRepository();
+            manager.reload(); // 重新扫目录：包是运行时创建的，不扫就看不见它
             if (alreadyEnabled(manager)) return false; // 已经启用（上一次会话记住的选择）
             // 还没启用：按扫描出来的真实 profile id 启用。原版目录包的 id 前缀是实现细节，
             // 所以先从扫描结果里认出本包，认不出再退回两种约定写法。
             String id = profileId(manager);
             if (id == null) {
-                manager.enable("file/" + PACK_DIR_NAME);
-                if (!alreadyEnabled(manager)) manager.enable(PACK_DIR_NAME);
-            } else {
-                manager.enable(id);
+                if (manager.isAvailable("file/" + PACK_DIR_NAME)) id = "file/" + PACK_DIR_NAME;
+                else if (manager.isAvailable(PACK_DIR_NAME)) id = PACK_DIR_NAME;
+            }
+            if (id != null) {
+                java.util.Set<String> selected = new java.util.HashSet<>(manager.getSelectedIds());
+                selected.add(id);
+                manager.setSelected(selected);
             }
             if (!alreadyEnabled(manager)) {
                 // 启用失败（包格式被判为不兼容、目录被别的东西占名）：记一条日志并返回，
@@ -267,10 +272,10 @@ public final class DoorSoundPack {
      *
      * @param client 客户端实例
      */
-    private static void persistEnabled(MinecraftClient client) {
+    private static void persistEnabled(Minecraft client) {
         try {
-            client.options.refreshResourcePacks(client.getResourcePackManager());
-            client.options.write();
+            client.options.updateResourcePacks(client.getResourcePackRepository());
+            client.options.save();
         } catch (RuntimeException e) {
             LOGGER.warn("Could not persist the enabled resource pack list", e);
         }
@@ -284,10 +289,10 @@ public final class DoorSoundPack {
      *
      * @param client 客户端实例
      */
-    public static void forceReload(MinecraftClient client) {
+    public static void forceReload(Minecraft client) {
         if (client == null) return;
         try {
-            client.reloadResources();
+            client.reloadResourcePacks();
         } catch (RuntimeException e) {
             LOGGER.warn("Failed to reload resources after changing the elevator arrival sounds", e);
         }
@@ -341,7 +346,7 @@ public final class DoorSoundPack {
         if (file == null) return;
         try {
             Files.createDirectories(file.getParent());
-            writeString(file, fingerprint);
+            writeUtf(file, fingerprint);
         } catch (IOException e) {
             LOGGER.warn("Could not record the elevator sound pack fingerprint", e);
         }
@@ -351,18 +356,18 @@ public final class DoorSoundPack {
      * @return 指纹文件 {@code <gameDir>/config/easyelevator/sound_pack.sha1}；客户端尚未就绪时返回 null
      */
     private static Path fingerprintFile() {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client == null || client.runDirectory == null) return null;
-        return client.runDirectory.toPath().resolve("config").resolve(Easyelevator.MOD_ID).resolve(FINGERPRINT_FILE);
+        Minecraft client = Minecraft.getInstance();
+        if (client == null || client.gameDirectory == null) return null;
+        return client.gameDirectory.toPath().resolve("config").resolve(Easyelevator.MOD_ID).resolve(FINGERPRINT_FILE);
     }
 
     /**
      * @return 资源包目录 {@code <gameDir>/resourcepacks/easyelevator_custom}；客户端尚未就绪时返回 null
      */
     private static Path packDir() {
-        MinecraftClient client = MinecraftClient.getInstance();
-        if (client == null || client.runDirectory == null) return null;
-        return client.runDirectory.toPath().resolve("resourcepacks").resolve(PACK_DIR_NAME);
+        Minecraft client = Minecraft.getInstance();
+        if (client == null || client.gameDirectory == null) return null;
+        return client.gameDirectory.toPath().resolve("resourcepacks").resolve(PACK_DIR_NAME);
     }
 
     /**
@@ -371,8 +376,8 @@ public final class DoorSoundPack {
      * @param manager 资源包管理器（已 {@code scanPacks} 过）
      * @return 本包的 id；没有这个包时返回 null
      */
-    private static String profileId(ResourcePackManager manager) {
-        for (String id : manager.getIds()) {
+    private static String profileId(PackRepository manager) {
+        for (String id : manager.getAvailableIds()) {
             if (id.equals(PACK_DIR_NAME) || id.endsWith("/" + PACK_DIR_NAME)) return id;
         }
         return null;
@@ -382,8 +387,8 @@ public final class DoorSoundPack {
      * @param manager 资源包管理器
      * @return 本包当前是否已经在"已启用"列表里
      */
-    private static boolean alreadyEnabled(ResourcePackManager manager) {
-        for (String id : manager.getEnabledIds()) {
+    private static boolean alreadyEnabled(PackRepository manager) {
+        for (String id : manager.getSelectedIds()) {
             if (id.equals(PACK_DIR_NAME) || id.endsWith("/" + PACK_DIR_NAME)) return true;
         }
         return false;
@@ -438,7 +443,7 @@ public final class DoorSoundPack {
      * @param text 文本内容（UTF-8）
      * @throws IOException 写盘失败
      */
-    private static void writeString(Path file, String text) throws IOException {
+    private static void writeUtf(Path file, String text) throws IOException {
         writeBytes(file, text.getBytes(StandardCharsets.UTF_8));
     }
 

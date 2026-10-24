@@ -247,7 +247,7 @@ public final class FilePicker {
                 // 同时把异常原文写进日志（父进程的标准流），便于定位。
                 + "} catch { [Console]::Error.WriteLine('OpenFileDialog failed: ' + $_.Exception.ToString()) }\r\n"
                 + "[IO.File]::WriteAllText('" + singleQuoted(result.toAbsolutePath().toString())
-                + "', $out, (New-Object System.Text.UTF8Encoding($false)))\r\n";
+                + "', $out, (New-Object System.Component.UTF8Encoding($false)))\r\n";
     }
 
     /**

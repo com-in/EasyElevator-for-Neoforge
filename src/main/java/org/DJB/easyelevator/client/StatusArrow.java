@@ -1,6 +1,6 @@
 package org.DJB.easyelevator.client;
 
-import net.minecraft.util.Util;
+import net.minecraft.Util;
 import org.DJB.easyelevator.logic.ElevatorStatus;
 
 /**
@@ -34,7 +34,7 @@ final class StatusArrow {
     static boolean moving(ElevatorStatus status) { return status==ElevatorStatus.UP||status==ElevatorStatus.DOWN; }
 
     /** @return 闪烁的"亮"相；灭的那半个周期两处显示同时留空，因此视觉上是同一个箭头在闪 */
-    static boolean lit() { return (Util.getMeasuringTimeMs()/BLINK_MS)%2==0; }
+    static boolean lit() { return (Util.getMillis()/BLINK_MS)%2==0; }
 
     /**
      * 取当前该显示的箭头字符。
@@ -53,10 +53,10 @@ final class StatusArrow {
      * <p>为什么要按固定宽度留位：箭头会闪烁（半周期不画字），如果居中排版时按"当前画不画"算宽度，
      * 楼层号就会跟着左右跳动；这里始终按箭头字符的宽度留位，箭头只在原位亮灭。
      *
-     * @param textRenderer 字体渲染器
+     * @param font 字体渲染器
      * @return 上/下箭头字符宽度的较大值（像素）
      */
-    static int width(net.minecraft.client.font.TextRenderer textRenderer) {
-        return Math.max(textRenderer.getWidth(net.minecraft.text.Text.literal(UP)),textRenderer.getWidth(net.minecraft.text.Text.literal(DOWN)));
+    static int width(net.minecraft.client.gui.Font font) {
+        return Math.max(font.width(net.minecraft.network.chat.Component.literal(UP).getString()),font.width(net.minecraft.network.chat.Component.literal(DOWN).getString()));
     }
 }

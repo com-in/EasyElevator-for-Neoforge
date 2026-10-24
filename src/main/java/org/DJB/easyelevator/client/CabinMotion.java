@@ -1,12 +1,12 @@
 package org.DJB.easyelevator.client;
 
-import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.network.ClientPlayNetworkHandler;
-import net.minecraft.client.network.ClientPlayerEntity;
-import net.minecraft.network.packet.Packet;
-import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
-import net.minecraft.util.math.MathHelper;
+import net.neoforged.neoforge.network.PacketDistributor;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientPacketListener;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.util.Mth;
 import org.DJB.easyelevator.entity.AbstractCabinEntity;
 import org.DJB.easyelevator.logic.ElevatorParameters;
 import org.DJB.easyelevator.network.ElevatorNetworking;
@@ -41,7 +41,7 @@ import java.util.WeakHashMap;
  *       避免重叠判定让相邻轿厢重复平移玩家。</li>
  *   <li><b>只允许客户端主线程访问</b>：{@code TRACKS}、{@code tickCabin}/{@code tickFrame} 都没有同步。
  *       {@code tickFrame} 是"本刻"的临时状态：由 {@link #beginPlayerTick} 写入、同一刻的
- *       {@link #sendMovement} 取用（原版 {@code ClientPlayerEntity#tick} 在末尾调用
+ *       {@link #sendMovement} 取用（原版 {@code LocalPlayer#tick} 在末尾调用
  *       {@code sendMovementPackets}，因此两者一定在同一刻内配对）。</li>
  *   <li>{@code TRACKS} 用 {@link WeakHashMap} 且键是实体：不阻止区块卸载后轿厢被回收，也不跨存档累积；
  *       {@link #beginPlayerTick} 还会顺手清掉已移除或换了世界的条目。</li>
@@ -90,22 +90,22 @@ public final class CabinMotion {
      *              以及已废弃的乘客偏移量（2.1.2 起客户端自行判定乘客，不再使用）
      */
     public static void receive(ElevatorNetworking.MotionFrame frame) {
-        var client = MinecraftClient.getInstance();
+        var client = Minecraft.getInstance();
         // 只在客户端世界已就绪、样本高度有限、且该 id 仍是本世界的轿厢时接受；否则静默丢弃（网络包一律视为不可信输入）。
-        if (client.world == null || !Double.isFinite(frame.y())
-                || !(client.world.getEntityById(frame.entityId()) instanceof AbstractCabinEntity cabin)) return;
+        if (client.level == null || !Double.isFinite(frame.y())
+                || !(client.level.getEntity(frame.entityId()) instanceof AbstractCabinEntity cabin)) return;
         Track track = TRACKS.computeIfAbsent(cabin, c -> new Track(c.getY()));
         // 乱序或重复的编号一律忽略：只认更新的样本，旧编号可能来自更早的一条链路。
         if (frame.tick() <= track.serverTick) return;
         track.serverTick = frame.tick();
         track.targetY = frame.y();
-        track.receivedAt = client.world.getTime();
+        track.receivedAt = client.level.getGameTime();
         cabin.useClientMotion();
     }
 
     /**
      * 每个客户端玩家 tick 的最开头调用（由 {@link org.DJB.easyelevator.mixin.client.ClientPlayerEntityMixin}
-     * 注入 {@code ClientPlayerEntity#tick} 的 HEAD）：提交全部轿厢位置，并把本机玩家托举到新的地板高度。
+     * 注入 {@code LocalPlayer#tick} 的 HEAD）：提交全部轿厢位置，并把本机玩家托举到新的地板高度。
      *
      * <p>必须早于原版玩家物理，否则移动中的地板会先进到玩家脚里（穿模、卡住或直接被顶飞）。
      *
@@ -114,11 +114,11 @@ public final class CabinMotion {
      *
      * @param player 本机客户端玩家；必须与当前客户端世界一致，且只应在客户端主线程调用
      */
-    public static void beginPlayerTick(ClientPlayerEntity player) {
+    public static void beginPlayerTick(LocalPlayer player) {
         tickCabin = null;
         // 先清理轨迹：已移除（区块卸载/实体回收）或已不在本玩家世界的（换维度）条目一律丢弃，
         // 否则会把上个世界的目标高度继续套用到新世界的第一刻。
-        TRACKS.entrySet().removeIf(e -> e.getKey().isRemoved() || e.getKey().getWorld() != player.getWorld());
+        TRACKS.entrySet().removeIf(e -> e.getKey().isRemoved() || e.getKey().level() != player.level());
         for (var entry : TRACKS.entrySet()) {
             AbstractCabinEntity cabin = entry.getKey();
             Track track = entry.getValue();
@@ -126,14 +126,14 @@ public final class CabinMotion {
             track.previousY = track.physicalY;
             // 本刻位移（格）：从实体当前（客户端预测的）位置到服务端目标位置；这个量也要原样加在乘客身上。
             double dy = track.targetY - cabin.getY();
-            boolean fresh = player.getWorld().getTime() - track.receivedAt <= ElevatorParameters.MOTION_STALE_TICKS;
+            boolean fresh = player.level().getGameTime() - track.receivedAt <= ElevatorParameters.MOTION_STALE_TICKS;
             // 样本够新（链路没断，绝不外推）、玩家存活且确实在厢内、位移未超瞬移阈值，三者缺一不可；
             // 位移超阈值说明是传送/归位而不是平台运动，此时把乘客一起拽走会把人甩出轿厢。
             // tickCabin == null 保证本刻只认第一辆轿厢，避免重叠判定重复平移玩家。
             boolean riding = tickCabin == null && fresh && player.isAlive() && cabin.containsPassenger(player)
                     && Math.abs(dy) <= ElevatorParameters.MOTION_SNAP_DISTANCE;
             // 无论是否托举乘客都必须提交位置：轿厢本体要跟住服务端样本，否则下一帧的 dy 会把这点误差累积进去。
-            cabin.setPosition(cabin.getX(), track.targetY, cabin.getZ());
+            cabin.setPos(cabin.getX(), track.targetY, cabin.getZ());
             track.physicalY = track.targetY;
             if (riding) {
                 tickCabin = cabin;
@@ -147,11 +147,11 @@ public final class CabinMotion {
 
     /**
      * 把还在轿厢里的乘客抬回<b>脚下那块支撑面</b>（地板面，重载舱还可能是货箱顶面；<b>只抬不压</b>）。
-     * 由 {@code ClientPlayerEntityMixin} 在 {@code ClientPlayerEntity#sendMovementPackets} 开头、也就是移动包被真正
+     * 由 {@code ClientPlayerEntityMixin} 在 {@code LocalPlayer#sendMovementPackets} 开头、也就是移动包被真正
      * 拼出来之前调用一次；{@link #beginPlayerTick} 每刻也兜一次。
      *
      * <p><b>为什么必须在下发移动包之前做</b>：支撑面是 {@code mixin/EntityViewMixin} 注入的<b>实体</b>碰撞，
-     * 而"脚底恰好贴在面上"时 {@link net.minecraft.util.math.Box#intersects(net.minecraft.util.math.Box)} 的
+     * 而"脚底恰好贴在面上"时 {@link net.minecraft.world.phys.AABB#intersects(net.minecraft.world.phys.AABB)} 的
      * 严格不等号会让这一次碰撞查询<b>查不到那块面</b>，于是玩家本刻会整段掉一格重力（实测 0.0784 格，
      * 约 8% 的刻发生一次）。本线上后果是"偶尔陷进地板/箱顶"的一帧抖动；26.3 线里同一处会被放大成
      * "服务端静默传送 → 模组自己的闸门把轿厢按成 BLOCKED → 上行一顿一顿"，因此三条线一起修掉。
@@ -161,7 +161,7 @@ public final class CabinMotion {
      *
      * @param player 本机客户端玩家；只应在客户端主线程调用
      */
-    public static void liftRidersToSupport(ClientPlayerEntity player) {
+    public static void liftRidersToSupport(LocalPlayer player) {
         for (AbstractCabinEntity cabin : TRACKS.keySet()) cabin.liftRiderToSupport(player);
     }
 
@@ -177,12 +177,14 @@ public final class CabinMotion {
      * @param handler 原版客户端连接处理器，转发与自定义包的发送都走它
      * @param packet 原版此刻决定发送的包
      */
-    public static void sendMovement(ClientPlayNetworkHandler handler, Packet<?> packet) {
-        if (tickCabin != null && packet instanceof PlayerMoveC2SPacket move
-                && ClientPlayNetworking.canSend(RiderMove.ID)) {
+    public static void sendMovement(ClientPacketListener handler, Packet<?> packet) {
+        if (tickCabin != null && packet instanceof ServerboundMovePlayerPacket move
+                && handler.getConnection() != null) {
             // 只包住原版自己选中的那个包：既不重复发包，也不额外制造一次传送。
-            ClientPlayNetworking.send(RiderMove.of(tickCabin.getId(), tickFrame, move));
-        } else handler.sendPacket(packet);
+            // canSend 的 NeoForge 等价物：连接存在即视为"已进服、可发包"——本包只在乘客随厢时发出，
+            // 而轿厢只会出现在装了本模组的服务端里。
+            PacketDistributor.sendToServer(RiderMove.of(tickCabin.getId(), tickFrame, move));
+        } else handler.send(packet);
     }
 
     /**
@@ -193,12 +195,15 @@ public final class CabinMotion {
      * @param cabin 要渲染的轿厢
      * @param delta 帧内进度 0..1（原版 tickDelta）
      * @return 视觉 Y，单位：格；该轿厢还没有运动轨迹（例如静止的旧实体）时退回原版
-     *         {@code lastRenderY → getY()} 的插值
+     *         {@code yo → getY()} 的插值（即原版 {@code Entity#getPosition} 会给出的高度）
      */
     public static double renderY(AbstractCabinEntity cabin, float delta) {
         Track track = TRACKS.get(cabin);
-        return track == null ? MathHelper.lerp(delta, cabin.lastRenderY, cabin.getY())
-                : MathHelper.lerp(delta, track.previousY, track.physicalY);
+        // yo = 原版上一刻的 Y（Entity#setOldPosAndRot 每刻写入，也是 Entity#getPosition(delta) 的插值起点）。
+        // 取它作为"原版此刻会把轿厢画在哪"的基准，渲染层据此只补一个差值；本方法必须是纯函数——
+        // 一旦在这里回写任何状态，补偿量就会依赖上一帧的补偿结果，形成反馈回路而抖动。
+        return track == null ? Mth.lerp(delta, cabin.yo, cabin.getY())
+                : Mth.lerp(delta, track.previousY, track.physicalY);
     }
 
     /**

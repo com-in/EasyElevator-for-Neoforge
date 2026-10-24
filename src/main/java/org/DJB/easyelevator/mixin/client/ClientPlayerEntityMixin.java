@@ -1,8 +1,8 @@
 package org.DJB.easyelevator.mixin.client;
 
-import net.minecraft.client.network.ClientPlayNetworkHandler;
-import net.minecraft.client.network.ClientPlayerEntity;
-import net.minecraft.network.packet.Packet;
+import net.minecraft.client.multiplayer.ClientPacketListener;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.network.protocol.Packet;
 import org.DJB.easyelevator.client.CabinMotion;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -11,7 +11,7 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * 客户端玩家实体（{@code ClientPlayerEntity}）的混入：把"本刻如何移动"拆成
+ * 客户端玩家实体（{@code LocalPlayer}）的混入：把"本刻如何移动"拆成
  * "先搬地板，再发带样本编号的移动包"两步，交由 {@link CabinMotion} 统一裁决。
  *
  * <p>两处注入（先后顺序就是原版一刻内的真实顺序）：
@@ -19,7 +19,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  *   <li>{@code tick} 的 <b>HEAD</b> → {@link CabinMotion#beginPlayerTick}：在玩家本刻物理与移动包生成之前，
  *       把轿厢搬到最新的服务端样本高度，并用同一差值托起乘客。放在 HEAD 是硬要求——若等玩家物理之后再搬，
  *       本刻玩家可能先撞进还在下方/上方的地板里（穿模或卡住）。</li>
- *   <li>{@code sendMovementPackets} 里对 {@code ClientPlayNetworkHandler#sendPacket} 的 <b>Redirect</b>
+ *   <li>{@code sendPosition}（1.21.1 中由旧名 {@code sendMovementPackets} 改名）里对
+ *       {@code ClientPacketListener#send} 的 <b>Redirect</b>
  *       → {@link CabinMotion#sendMovement}：原版"这一刻要不要发、发哪个移动包"的逻辑完全保留，
  *       只把落点改成我方——随厢时换成携带样本编号的 {@code RiderMove}，否则原样转发。</li>
  * </ol>
@@ -34,10 +35,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  *       注入失败即客户端启动失败。</li>
  *   <li>本类<b>不改</b>玩家输入、速度与物理常量：客户端物理仍是原版，位移只由
  *       {@link CabinMotion#beginPlayerTick} 平移，权威换算留在服务端。</li>
- *   <li>{@code (ClientPlayerEntity)(Object)this} 的转型是混入类自身不继承目标类时的必然写法，不能省。</li>
+ *   <li>{@code (LocalPlayer)(Object)this} 的转型是混入类自身不继承目标类时的必然写法，不能省。</li>
  * </ul>
  */
-@Mixin(ClientPlayerEntity.class)
+@Mixin(LocalPlayer.class)
 public abstract class ClientPlayerEntityMixin {
     /**
      * 在玩家本刻 tick 的最开头提交轿厢位置，并在本机乘客确实在厢内时随厢平移玩家。
@@ -49,22 +50,22 @@ public abstract class ClientPlayerEntityMixin {
      */
     @Inject(method = "tick", at = @At("HEAD"))
     private void easyelevator$moveFloor(CallbackInfo ci) {
-        CabinMotion.beginPlayerTick((ClientPlayerEntity) (Object) this);
+        CabinMotion.beginPlayerTick((LocalPlayer) (Object) this);
     }
 
     /**
      * 移动包被真正拼出来之前，把乘客抬回脚下那块支撑面（见 {@link CabinMotion#liftRidersToSupport}）。
      *
      * <p>为什么必须卡在这个位置：本刻玩家物理可能让他掉了一格重力、陷进支撑面（脚底恰好贴面时，
-     * 碰撞查询会因为 {@code Box#intersects} 的严格不等号而漏掉轿厢地板/货箱顶这个实体碰撞），
+     * 碰撞查询会因为 {@code AABB#intersects} 的严格不等号而漏掉轿厢地板/货箱顶这个实体碰撞），
      * 而这条路径紧接着就要把绝对 Y 变成移动包。放 HEAD 是为了让下面读到的 {@code getY()}
      * 已经是抬回后的值。
      *
      * @param ci 原版回调信息；本方法不取消调用
      */
-    @Inject(method = "sendMovementPackets", at = @At("HEAD"))
+    @Inject(method = "sendPosition", at = @At("HEAD"))
     private void easyelevator$liftRiderToSupport(CallbackInfo ci) {
-        CabinMotion.liftRidersToSupport((ClientPlayerEntity) (Object) this);
+        CabinMotion.liftRidersToSupport((LocalPlayer) (Object) this);
     }
 
     /**
@@ -72,15 +73,15 @@ public abstract class ClientPlayerEntityMixin {
      * 否则原样转发给原版连接处理器。
      *
      * <p>副作用：可能"少发"一个原版移动包（被替换成自定义包），但绝不重复发送；
-     * 包不是 {@code PlayerMoveC2SPacket}、或本刻没有轿厢承载玩家时，行为与直接调用
+     * 包不是 {@code ServerboundMovePlayerPacket}、或本刻没有轿厢承载玩家时，行为与直接调用
      * {@code handler.sendPacket(packet)} 完全一致。
      *
      * @param handler 原版客户端连接处理器，最终仍由它发包（自定义包也走它）
      * @param packet 原版此刻决定发送的包
      */
-    @Redirect(method = "sendMovementPackets", at = @At(value = "INVOKE",
-            target = "Lnet/minecraft/client/network/ClientPlayNetworkHandler;sendPacket(Lnet/minecraft/network/packet/Packet;)V"))
-    private void easyelevator$relativeMove(ClientPlayNetworkHandler handler, Packet<?> packet) {
+    @Redirect(method = "sendPosition", at = @At(value = "INVOKE",
+            target = "Lnet/minecraft/client/multiplayer/ClientPacketListener;send(Lnet/minecraft/network/protocol/Packet;)V"))
+    private void easyelevator$relativeMove(ClientPacketListener handler, Packet<?> packet) {
         CabinMotion.sendMovement(handler, packet);
     }
 }
