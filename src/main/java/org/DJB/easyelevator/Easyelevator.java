@@ -40,8 +40,10 @@ import org.DJB.easyelevator.screen.CargoScreenHandler;
  * 普通 {@link #CABIN} / {@link #CABIN_ITEM}（限载 {@link org.DJB.easyelevator.logic.ElevatorParameters#PASSENGER_NUM_LIMIT} 人）、
  * 高速 {@link #HIGH_SPEED_CABIN} / {@link #HIGH_SPEED_CABIN_ITEM}（速度 2.5 倍，外观与普通逐面相同）、
  * 观光 {@link #OBSERVATION_CABIN} / {@link #OBSERVATION_CABIN_ITEM}（四面玻璃，性能不变）、
+ * 高速观光 {@link #HIGH_SPEED_OBSERVATION_CABIN} / {@link #HIGH_SPEED_OBSERVATION_CABIN_ITEM}
+ * （观光的玻璃外观 + 高速的速度，其余照抄两个来源型号）、
  * 重载 {@link #POWERFUL_CABIN} / {@link #POWERFUL_CABIN_ITEM}（速度 2/3、27 格货舱、限载随货量在 1..20 之间变化）。
- * 四种轿厢的实体 ID 与物品 ID 一一对应；只有重载型号额外注册一个容器菜单 {@link #CARGO_SCREEN}。</p>
+ * 五种轿厢的实体 ID 与物品 ID 一一对应；只有重载型号额外注册一个容器菜单 {@link #CARGO_SCREEN}。</p>
  *
  * <p><b>与 Fabric 版的差异（关键）</b>：Fabric 版在 {@code ModInitializer#onInitialize} 里直接
  * {@code Registry.register}，且单例写在静态字段初始化里也能跑——因为 Fabric 的注册表随时可写。
@@ -127,6 +129,16 @@ public class Easyelevator {
      */
     public static EntityType<ObservationCabinEntity> OBSERVATION_CABIN;
     /**
+     * 高速观光电梯轿厢实体类型（注册 ID {@code easyelevator:high_speed_observation_cabin}）。
+     *
+     * <p>碰撞与追踪参数与 {@link #CABIN} 相同，是 {@link #HIGH_SPEED_CABIN}（速度）与
+     * {@link #OBSERVATION_CABIN}（外观）的组合：实体类把速度设为
+     * {@link org.DJB.easyelevator.logic.ElevatorParameters#HIGH_SPEED}，并让
+     * {@code glassWalls()} 返回 true，因此世界里的表现就是"跑得很快的观光轿厢"。
+     * 玻璃只改客户端绘制，碰撞外壳照旧按 {@code collisionBoxes()} 生成，井道无需改动。</p>
+     */
+    public static EntityType<HighSpeedObservationCabinEntity> HIGH_SPEED_OBSERVATION_CABIN;
+    /**
      * 重载电梯轿厢实体类型（注册 ID {@code easyelevator:powerful_cabin}）。
      *
      * <p>碰撞与追踪参数与 {@link #CABIN} 完全相同（井道尺寸一致，换型号不需要改建筑），差别有三处：
@@ -146,7 +158,7 @@ public class Easyelevator {
     /**
      * 电梯轿厢生成物品（{@code ITEM} 事件创建）；{@code stacksTo(1)} 限制为一格一个，避免一次放置多台轿厢。
      *
-     * <p><b>四个</b>物品只在"生成哪一种轿厢 / 回收哪一件"上不同，逻辑共用 {@link CabinItem}；
+     * <p><b>五个</b>物品只在"生成哪一种轿厢 / 回收哪一件"上不同，逻辑共用 {@link CabinItem}；
      * 实体类型用 Supplier 延迟读取，因此即便 {@code ITEM} 事件早于 {@code ENTITY_TYPE} 事件也无妨。
      * 重载轿厢的物品还多一条 Tooltip 提示（怎么打开货舱），见 {@code CabinItem.appendTooltip}。</p>
      */
@@ -155,6 +167,8 @@ public class Easyelevator {
     public static Item HIGH_SPEED_CABIN_ITEM;
     /** 观光轿厢生成物品（右键轨道生成观光轿厢，四面玻璃，性能与普通一致）。 */
     public static Item OBSERVATION_CABIN_ITEM;
+    /** 高速观光轿厢生成物品（观光玻璃外观 + 高速速度：0.50 格/刻 = 10 格/秒）。 */
+    public static Item HIGH_SPEED_OBSERVATION_CABIN_ITEM;
     /** 重载轿厢生成物品（右键轨道生成重载轿厢，速度 2/3、27 格货舱、限载随货量变化）。 */
     public static Item POWERFUL_CABIN_ITEM;
 
@@ -245,6 +259,7 @@ public class Easyelevator {
                 CABIN_ITEM = new CabinItem(new Item.Properties().stacksTo(1), () -> CABIN);
                 HIGH_SPEED_CABIN_ITEM = new CabinItem(new Item.Properties().stacksTo(1), () -> HIGH_SPEED_CABIN);
                 OBSERVATION_CABIN_ITEM = new CabinItem(new Item.Properties().stacksTo(1), () -> OBSERVATION_CABIN);
+                HIGH_SPEED_OBSERVATION_CABIN_ITEM = new CabinItem(new Item.Properties().stacksTo(1), () -> HIGH_SPEED_OBSERVATION_CABIN);
                 POWERFUL_CABIN_ITEM = new CabinItem(new Item.Properties().stacksTo(1), () -> POWERFUL_CABIN);
                 event.register(BuiltInRegistries.ITEM.key(), id("elevator_rail"),
                         () -> new BlockItem(RAIL, new Item.Properties()));
@@ -253,15 +268,18 @@ public class Easyelevator {
                 event.register(BuiltInRegistries.ITEM.key(), id("cabin"), () -> CABIN_ITEM);
                 event.register(BuiltInRegistries.ITEM.key(), id("high_speed_cabin"), () -> HIGH_SPEED_CABIN_ITEM);
                 event.register(BuiltInRegistries.ITEM.key(), id("observation_cabin"), () -> OBSERVATION_CABIN_ITEM);
+                event.register(BuiltInRegistries.ITEM.key(), id("high_speed_observation_cabin"), () -> HIGH_SPEED_OBSERVATION_CABIN_ITEM);
                 event.register(BuiltInRegistries.ITEM.key(), id("powerful_cabin"), () -> POWERFUL_CABIN_ITEM);
             } else if (registry == BuiltInRegistries.ENTITY_TYPE) {
                 CABIN = cabinType(CabinEntity::new, "cabin");
                 HIGH_SPEED_CABIN = cabinType(HighSpeedCabinEntity::new, "high_speed_cabin");
                 OBSERVATION_CABIN = cabinType(ObservationCabinEntity::new, "observation_cabin");
+                HIGH_SPEED_OBSERVATION_CABIN = cabinType(HighSpeedObservationCabinEntity::new, "high_speed_observation_cabin");
                 POWERFUL_CABIN = cabinType(PowerfulCabinEntity::new, "powerful_cabin");
                 event.register(BuiltInRegistries.ENTITY_TYPE.key(), id("cabin"), () -> CABIN);
                 event.register(BuiltInRegistries.ENTITY_TYPE.key(), id("high_speed_cabin"), () -> HIGH_SPEED_CABIN);
                 event.register(BuiltInRegistries.ENTITY_TYPE.key(), id("observation_cabin"), () -> OBSERVATION_CABIN);
+                event.register(BuiltInRegistries.ENTITY_TYPE.key(), id("high_speed_observation_cabin"), () -> HIGH_SPEED_OBSERVATION_CABIN);
                 event.register(BuiltInRegistries.ENTITY_TYPE.key(), id("powerful_cabin"), () -> POWERFUL_CABIN);
             } else if (registry == BuiltInRegistries.BLOCK_ENTITY_TYPE) {
                 LANDING_DOOR_BE = BlockEntityType.Builder.of(LandingDoorBlockEntity::new, LANDING_DOOR).build(null);
@@ -284,6 +302,7 @@ public class Easyelevator {
                             output.accept(CABIN_ITEM);
                             output.accept(HIGH_SPEED_CABIN_ITEM);
                             output.accept(OBSERVATION_CABIN_ITEM);
+                            output.accept(HIGH_SPEED_OBSERVATION_CABIN_ITEM);
                             output.accept(POWERFUL_CABIN_ITEM);
                         })
                         .build();

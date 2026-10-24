@@ -15,6 +15,8 @@
   "entity.easyelevator.high_speed_cabin": "高速电梯轿厢",
   "item.easyelevator.observation_cabin": "观光电梯轿厢",
   "entity.easyelevator.observation_cabin": "观光电梯轿厢",
+  "item.easyelevator.high_speed_observation_cabin": "高速观光电梯轿厢",
+  "entity.easyelevator.high_speed_observation_cabin": "高速观光电梯轿厢",
   "item.easyelevator.powerful_cabin": "重载电梯轿厢",
   "entity.easyelevator.powerful_cabin": "重载电梯轿厢",
   "message.easyelevator.no_cabin": "这条线路没有轿厢，请先在轨道上放置轿厢。",

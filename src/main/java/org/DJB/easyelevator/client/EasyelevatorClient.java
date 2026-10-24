@@ -53,9 +53,9 @@ public final class EasyelevatorClient {
     }
 
     /**
-     * 注册四个轿厢实体渲染器与楼层门方块实体渲染器。
+     * 注册五个轿厢实体渲染器与楼层门方块实体渲染器。
      *
-     * <p>四种轿厢（普通 / 高速 / 观光 / 重载）共用同一个渲染器：泛型参数取共同的父类，
+     * <p>五种轿厢（普通 / 高速 / 观光 / 高速观光 / 重载）共用同一个渲染器：泛型参数取共同的父类，
      * 因此每个实体类型各注册一次即可；外观差异（观光型号的玻璃墙、重载型号的重载内饰与双灯补光）
      * 由实体自身的 {@code glassWalls()} / {@code heavyDuty()} 决定，而不是按实体类型分支——
      * 将来加型号时这里只需要多一行注册。</p>
@@ -68,6 +68,7 @@ public final class EasyelevatorClient {
         event.registerEntityRenderer(Easyelevator.CABIN, CabinRenderer::new);
         event.registerEntityRenderer(Easyelevator.HIGH_SPEED_CABIN, CabinRenderer::new);
         event.registerEntityRenderer(Easyelevator.OBSERVATION_CABIN, CabinRenderer::new);
+        event.registerEntityRenderer(Easyelevator.HIGH_SPEED_OBSERVATION_CABIN, CabinRenderer::new);
         event.registerEntityRenderer(Easyelevator.POWERFUL_CABIN, CabinRenderer::new);
         event.registerBlockEntityRenderer(Easyelevator.LANDING_DOOR_BE, LandingDoorRenderer::new);
     }
